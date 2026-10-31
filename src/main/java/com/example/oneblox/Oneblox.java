@@ -64,6 +64,7 @@ public class Oneblox implements ModInitializer {
 
     static class Data {
         int ver = 0;
+        String mode;
         int nextIsland = 0;
         boolean hubSet = false; double hubX = 0.5, hubY = 64, hubZ = 0.5;
         Map<String, Long> money = new HashMap<>();
@@ -72,7 +73,11 @@ public class Oneblox implements ModInitializer {
         Map<Integer, Isl> islands = new HashMap<>();
     }
 
-    static final String DIM = "oneblox:void";   // our own empty dimension (see data/oneblox/dimension/void.json)
+    // Mode 1: our own empty dimension "oneblox:void" (data/oneblox/dimension/void.json), islands at y=64.
+    // Mode 2 (fallback if that dimension did not load): islands float high in the normal overworld at y=290.
+    static boolean voidDim = false;
+    static int Y() { return voidDim ? 64 : 290; }
+    static String WORLD() { return voidDim ? "oneblox:void" : "minecraft:overworld"; }
     static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     static final Random RNG = new Random();
     static MinecraftServer server;
@@ -127,7 +132,7 @@ public class Oneblox implements ModInitializer {
 
     // ---------- small helpers ----------
     static void msg(ServerPlayer p, String s) { p.sendSystemMessage(Component.literal(s)); }
-    static String fmt(long v) { return "$" + String.format("%,d", v); }
+    static String fmt(long v) { return "$" + String.format(Locale.US, "%,d", v); }
     static long bal(ServerPlayer p) { return data.money.getOrDefault(p.getStringUUID(), 0L); }
     static void add(ServerPlayer p, long a) { data.money.merge(p.getStringUUID(), a, Long::sum); }
 
@@ -149,13 +154,13 @@ public class Oneblox implements ModInitializer {
     }
 
     /** Runs a command inside the void dimension. */
-    static void runIn(String cmd) { run("execute in " + DIM + " run " + cmd); }
+    static void runIn(String cmd) { run("execute in " + WORLD() + " run " + cmd); }
 
-    static boolean inVoid(ServerPlayer p) { return String.valueOf(p.level().dimension()).contains(DIM); }
+    static boolean inVoid(ServerPlayer p) { return String.valueOf(p.level().dimension()).contains(WORLD()); }
     static boolean inOverworld(ServerPlayer p) { return String.valueOf(p.level().dimension()).contains("minecraft:overworld"); }
 
     static void tp(ServerPlayer p, double x, double y, double z) {
-        run("execute in " + DIM + " run tp " + p.getStringUUID() + " " + x + " " + y + " " + z);
+        run("execute in " + WORLD() + " run tp " + p.getStringUUID() + " " + x + " " + y + " " + z);
     }
 
     // delayed tasks
@@ -185,7 +190,7 @@ public class Oneblox implements ModInitializer {
     static void toHome(ServerPlayer p) {
         Isl is = islandOf(p.getStringUUID());
         if (is == null) { createIsland(p); return; }
-        tp(p, cx(is.idx) + 0.5, 64, cz(is.idx) + 3.5);
+        tp(p, cx(is.idx) + 0.5, Y(), cz(is.idx) + 3.5);
     }
 
     static void toHub(ServerPlayer p) {
@@ -204,15 +209,17 @@ public class Oneblox implements ModInitializer {
         msg(p, "Building your island, one moment...");
         runIn("forceload add " + (x - R) + " " + (z - R) + " " + (x + R) + " " + (z + R));
         later(40, () -> {
-            runIn("fill " + (x - 2) + " 63 " + (z - 2) + " " + (x + 2) + " 63 " + (z + 2) + " minecraft:grass_block");
-            runIn("setblock " + x + " 64 " + z + " minecraft:grass_block");
+            int y = Y();
+            runIn("fill " + (x - 2) + " " + (y - 1) + " " + (z - 2) + " " + (x + 2) + " " + (y - 1) + " " + (z + 2) + " minecraft:grass_block");
+            runIn("setblock " + x + " " + y + " " + z + " minecraft:grass_block");
             String g = " minecraft:red_stained_glass";
-            runIn("fill " + (x - R) + " 58 " + (z - R) + " " + (x + R) + " 72 " + (z - R) + g);
-            runIn("fill " + (x - R) + " 58 " + (z + R) + " " + (x + R) + " 72 " + (z + R) + g);
-            runIn("fill " + (x - R) + " 58 " + (z - R) + " " + (x - R) + " 72 " + (z + R) + g);
-            runIn("fill " + (x + R) + " 58 " + (z - R) + " " + (x + R) + " 72 " + (z + R) + g);
+            int y1 = y - 6, y2 = y + 8;
+            runIn("fill " + (x - R) + " " + y1 + " " + (z - R) + " " + (x + R) + " " + y2 + " " + (z - R) + g);
+            runIn("fill " + (x - R) + " " + y1 + " " + (z + R) + " " + (x + R) + " " + y2 + " " + (z + R) + g);
+            runIn("fill " + (x - R) + " " + y1 + " " + (z - R) + " " + (x - R) + " " + y2 + " " + (z + R) + g);
+            runIn("fill " + (x + R) + " " + y1 + " " + (z - R) + " " + (x + R) + " " + y2 + " " + (z + R) + g);
         });
-        later(50, () -> { tp(p, x + 0.5, 64, z + 3.5); is.ready = true; msg(p, "Welcome to your island! Break the grass block."); });
+        later(50, () -> { tp(p, x + 0.5, Y(), z + 3.5); is.ready = true; msg(p, "Welcome to your island! Break the grass block."); });
         later(120, () -> runIn("forceload remove " + (x - R) + " " + (z - R) + " " + (x + R) + " " + (z + R)));
         saveAll();
     }
@@ -225,7 +232,7 @@ public class Oneblox implements ModInitializer {
             String[] m = PHASE_MOBS[ph];
             b = "minecraft:spawner{SpawnData:{entity:{id:\"minecraft:" + m[RNG.nextInt(m.length)] + "\"}}}";
         }
-        runIn("setblock " + cx(is.idx) + " 64 " + cz(is.idx) + " " + b + " keep");
+        runIn("setblock " + cx(is.idx) + " " + Y() + " " + cz(is.idx) + " " + b + " keep");
     }
 
     static void tellIsland(Isl is, String s) {
@@ -248,10 +255,10 @@ public class Oneblox implements ModInitializer {
     /** Keeps players inside their own island (or the hub) and out of the void. */
     static void enforce(ServerPlayer p, Isl is) {
         if (is == null || !is.ready) return;
-        if (inOverworld(p)) { toHome(p); return; }   // respawned or wandered into the normal overworld: back to the void
+        if (voidDim && inOverworld(p)) { toHome(p); return; }   // respawned in the normal overworld: back to the void
         if (!inVoid(p) || isAdmin(p)) return;
         double x = p.getX(), z = p.getZ();
-        if (p.getY() < -10) { toHome(p); return; }
+        if (p.getY() < (voidDim ? -10 : Y() - 40)) { toHome(p); return; }
         if (inHub(x, z)) return;
         if (Math.abs(x - cx(is.idx)) > cfg.radius || Math.abs(z - cz(is.idx)) > cfg.radius) {
             msg(p, "You can't leave your island.");
@@ -261,10 +268,11 @@ public class Oneblox implements ModInitializer {
 
     static void buildHub() {
         if (data.hubSet) return;
+        int y = Y();
         runIn("forceload add -25 -25 25 25");
-        later(40, () -> runIn("fill -20 63 -20 20 63 20 minecraft:stone_bricks"));
+        later(40, () -> runIn("fill -20 " + (y - 1) + " -20 20 " + (y - 1) + " 20 minecraft:stone_bricks"));
         later(120, () -> runIn("forceload remove -25 -25 25 25"));
-        data.hubSet = true; data.hubX = 0.5; data.hubY = 64; data.hubZ = 0.5;
+        data.hubSet = true; data.hubX = 0.5; data.hubY = y; data.hubZ = 0.5;
         saveAll();
     }
 
@@ -276,7 +284,11 @@ public class Oneblox implements ModInitializer {
             dir = FabricLoader.getInstance().getConfigDir().resolve("oneblox");
             cfg = load("config.json", Cfg.class, new Cfg());
             data = load("data.json", Data.class, new Data());
-            if (data.ver != 2) { data = new Data(); data.ver = 2; }   // old test data from before the void dimension: start fresh
+            voidDim = false;
+            for (var lvl : server.getAllLevels()) if (String.valueOf(lvl.dimension()).contains("oneblox:void")) voidDim = true;
+            String mode = voidDim ? "void" : "sky";
+            if (data.ver != 3 || !mode.equals(data.mode)) { data = new Data(); data.ver = 3; data.mode = mode; }  // fresh start when the mode changes
+            System.out.println("[Oneblox] Mode: " + (voidDim ? "own void dimension" : "FALLBACK - floating islands in the overworld (oneblox:void did not load)"));
             save("config.json", cfg);
             buildHub();
         });
@@ -300,7 +312,7 @@ public class Oneblox implements ModInitializer {
         PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, be) -> {
             if (!(player instanceof ServerPlayer sp)) return;
             Isl is = islandOf(sp.getStringUUID());
-            boolean one = is != null && inVoid(sp) && pos.getX() == cx(is.idx) && pos.getY() == 64 && pos.getZ() == cz(is.idx);
+            boolean one = is != null && inVoid(sp) && pos.getX() == cx(is.idx) && pos.getY() == Y() && pos.getZ() == cz(is.idx);
             String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
             pay(sp, blockPay(id, one));
             if (!one) return;
@@ -311,7 +323,7 @@ public class Oneblox implements ModInitializer {
             later(1, () -> placeNext(fis));
             if (RNG.nextInt(100) < cfg.mobChance) {
                 String[] m = PHASE_MOBS[phase(is)];
-                runIn("summon minecraft:" + m[RNG.nextInt(m.length)] + " " + (cx(is.idx) + 0.5) + " 65 " + (cz(is.idx) + 0.5));
+                runIn("summon minecraft:" + m[RNG.nextInt(m.length)] + " " + (cx(is.idx) + 0.5) + " " + (Y() + 1) + " " + (cz(is.idx) + 0.5));
             }
         });
 
@@ -324,9 +336,53 @@ public class Oneblox implements ModInitializer {
         CommandRegistrationCallback.EVENT.register((d, access, env) -> registerCommands(d));
     }
 
+    // ---------- sidebar (one per player, using the 16 team-colour sidebar slots) ----------
+    static final String[] COLORS = {"black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray",
+            "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white"};
+    static final Map<String, Integer> SLOT = new HashMap<>();
+    static final Map<String, List<String>> LINES = new HashMap<>();
+
+    static int slotFor(ServerPlayer p) {
+        String id = p.getStringUUID();
+        Integer have = SLOT.get(id);
+        if (have != null) return have;
+        int s = 0;
+        while (SLOT.containsValue(s) && s < 15) s++;
+        SLOT.put(id, s);
+        String c = COLORS[s];
+        run("scoreboard objectives add ob_" + s + " dummy {\"text\":\"ONEBLOX\",\"color\":\"gold\",\"bold\":true}");
+        run("scoreboard objectives setdisplay sidebar.team." + c + " ob_" + s);
+        run("team add ob_" + s);
+        run("team modify ob_" + s + " color " + c);
+        run("team join ob_" + s + " " + p.getName().getString());
+        LINES.remove(id);
+        return s;
+    }
+
+    static void sidebar(ServerPlayer p, Isl is) {
+        int s = slotFor(p);
+        String id = p.getStringUUID();
+        int ph = phase(is);
+        int into = is.broken - ph * cfg.blocksPerPhase;
+        List<String> now = new ArrayList<>();
+        now.add("\u00a76Money: \u00a7f" + fmt(bal(p)));
+        now.add("\u00a7bPhase " + (ph + 1) + ": \u00a7f" + PHASE_NAME[ph]);
+        now.add("\u00a7aBlocks: \u00a7f" + (ph >= PHASE_NAME.length - 1 ? String.valueOf(is.broken) : into + "/" + cfg.blocksPerPhase));
+        now.add("\u00a7dMembers: \u00a7f" + is.members.size());
+        now.add("\u00a77oneblox");
+        List<String> old = LINES.getOrDefault(id, List.of());
+        if (now.equals(old)) return;
+        for (int i = 0; i < now.size(); i++)
+            run("scoreboard players set \"" + now.get(i) + "\" ob_" + s + " " + (now.size() - i));
+        for (String o : old) if (!now.contains(o)) run("scoreboard players reset \"" + o + "\" ob_" + s);
+        LINES.put(id, now);
+    }
+
     static void everySecond() {
+        Set<String> online = new HashSet<>();
         for (ServerPlayer p : new ArrayList<>(server.getPlayerList().getPlayers())) {
             String id = p.getStringUUID();
+            online.add(id);
             data.names.put(id, p.getName().getString());
             Isl is = islandOf(id);
             if (is == null) { createIsland(p); continue; }
@@ -338,7 +394,9 @@ public class Oneblox implements ModInitializer {
             if (last != null && fish > last) pay(p, (long) (fish - last) * cfg.fishPay);
 
             enforce(p, is);
+            sidebar(p, is);
         }
+        SLOT.keySet().removeIf(k -> !online.contains(k));   // free the slot of players who left
     }
 
     // ---------- commands ----------
