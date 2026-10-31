@@ -20,6 +20,7 @@ import net.minecraft.commands.arguments.EntityArgument;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ClientboundSetActionBarTextPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -46,6 +47,7 @@ public class Oneblox implements ModInitializer {
         int mobChance = 8;         // % chance a mob appears when the block is broken
         int spawnerChance = 2;     // % chance the next block is a spawner (phase 2+)
         int hubRadius = 300;       // area around hub where players may roam
+        int hubBorder = 60;        // half-size of the border shown around the hub
         int maxMembers = 5;
         long fishPay = 10;
         double mobPayPerHealth = 1.5;
@@ -75,8 +77,10 @@ public class Oneblox implements ModInitializer {
 
     // Mode 1: our own empty dimension "oneblox:void" (data/oneblox/dimension/void.json), islands at y=64.
     // Mode 2 (fallback if that dimension did not load): islands float high in the normal overworld at y=290.
-    static boolean voidDim = false;
-    static int Y() { return voidDim ? 64 : 290; }
+    // Mode 3: the overworld itself is already a void (Superflat "The Void"), islands at y=64.
+    static boolean voidDim = false, voidWorld = false;
+    static int Y() { return (voidDim || voidWorld) ? 64 : 290; }
+    static String modeName() { return voidDim ? "void" : voidWorld ? "flat" : "sky"; }
     static String WORLD() { return voidDim ? "oneblox:void" : "minecraft:overworld"; }
     static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     static final Random RNG = new Random();
@@ -190,7 +194,7 @@ public class Oneblox implements ModInitializer {
     static void toHome(ServerPlayer p) {
         Isl is = islandOf(p.getStringUUID());
         if (is == null) { createIsland(p); return; }
-        tp(p, cx(is.idx) + 0.5, Y(), cz(is.idx) + 3.5);
+        tp(p, cx(is.idx) + 0.5, Y() + 1, cz(is.idx) + 0.5);
     }
 
     static void toHub(ServerPlayer p) {
@@ -205,22 +209,17 @@ public class Oneblox implements ModInitializer {
         is.idx = idx; is.owner = id; is.members.add(id);
         data.islands.put(idx, is);
         data.islandOf.put(id, idx);
-        int x = cx(idx), z = cz(idx), R = cfg.radius;
+        int x = cx(idx), z = cz(idx);
         msg(p, "Building your island, one moment...");
-        runIn("forceload add " + (x - R) + " " + (z - R) + " " + (x + R) + " " + (z + R));
-        later(40, () -> {
-            int y = Y();
-            runIn("fill " + (x - 2) + " " + (y - 1) + " " + (z - 2) + " " + (x + 2) + " " + (y - 1) + " " + (z + 2) + " minecraft:grass_block");
-            runIn("setblock " + x + " " + y + " " + z + " minecraft:grass_block");
-            String g = " minecraft:red_stained_glass";
-            int y1 = y - 6, y2 = y + 8;
-            runIn("fill " + (x - R) + " " + y1 + " " + (z - R) + " " + (x + R) + " " + y2 + " " + (z - R) + g);
-            runIn("fill " + (x - R) + " " + y1 + " " + (z + R) + " " + (x + R) + " " + y2 + " " + (z + R) + g);
-            runIn("fill " + (x - R) + " " + y1 + " " + (z - R) + " " + (x - R) + " " + y2 + " " + (z + R) + g);
-            runIn("fill " + (x + R) + " " + y1 + " " + (z - R) + " " + (x + R) + " " + y2 + " " + (z + R) + g);
+        runIn("forceload add " + x + " " + z);
+        later(40, () -> runIn("setblock " + x + " " + Y() + " " + z + " minecraft:grass_block"));
+        later(50, () -> {
+            tp(p, x + 0.5, Y() + 1, z + 0.5);
+            is.ready = true;
+            msg(p, "Welcome to your island! Break the grass block to start. Type /ob for help.");
+            if (modeName().equals("sky")) msg(p, "(The empty void world did not load, so your island floats in the normal overworld.)");
         });
-        later(50, () -> { tp(p, x + 0.5, Y(), z + 3.5); is.ready = true; msg(p, "Welcome to your island! Break the grass block."); });
-        later(120, () -> runIn("forceload remove " + (x - R) + " " + (z - R) + " " + (x + R) + " " + (z + R)));
+        later(120, () -> runIn("forceload remove " + x + " " + z));
         saveAll();
     }
 
@@ -258,7 +257,7 @@ public class Oneblox implements ModInitializer {
         if (voidDim && inOverworld(p)) { toHome(p); return; }   // respawned in the normal overworld: back to the void
         if (!inVoid(p) || isAdmin(p)) return;
         double x = p.getX(), z = p.getZ();
-        if (p.getY() < (voidDim ? -10 : Y() - 40)) { toHome(p); return; }
+        if (p.getY() < ((voidDim || voidWorld) ? -10 : Y() - 40)) { toHome(p); return; }
         if (inHub(x, z)) return;
         if (Math.abs(x - cx(is.idx)) > cfg.radius || Math.abs(z - cz(is.idx)) > cfg.radius) {
             msg(p, "You can't leave your island.");
@@ -286,9 +285,16 @@ public class Oneblox implements ModInitializer {
             data = load("data.json", Data.class, new Data());
             voidDim = false;
             for (var lvl : server.getAllLevels()) if (String.valueOf(lvl.dimension()).contains("oneblox:void")) voidDim = true;
-            String mode = voidDim ? "void" : "sky";
-            if (data.ver != 3 || !mode.equals(data.mode)) { data = new Data(); data.ver = 3; data.mode = mode; }  // fresh start when the mode changes
-            System.out.println("[Oneblox] Mode: " + (voidDim ? "own void dimension" : "FALLBACK - floating islands in the overworld (oneblox:void did not load)"));
+            voidWorld = false;
+            if (!voidDim) {
+                var ow = server.overworld();
+                voidWorld = ow.getBlockState(new BlockPos(1000, 40, 1000)).isAir()
+                    && ow.getBlockState(new BlockPos(1000, 0, 1000)).isAir()
+                    && ow.getBlockState(new BlockPos(500, 20, 500)).isAir();
+            }
+            String mode = modeName();
+            if (data.ver != 4 || !mode.equals(data.mode)) { data = new Data(); data.ver = 4; data.mode = mode; }  // fresh start when the mode changes
+            System.out.println("[Oneblox] Mode: " + (voidDim ? "own void dimension" : voidWorld ? "void overworld (Superflat void)" : "FALLBACK - floating islands in the normal overworld (oneblox:void did not load)"));
             save("config.json", cfg);
             buildHub();
         });
@@ -336,6 +342,28 @@ public class Oneblox implements ModInitializer {
         CommandRegistrationCallback.EVENT.register((d, access, env) -> registerCommands(d));
     }
 
+    // ---------- per-player world border (the normal blue/red vanilla border) ----------
+    static boolean borderWarned = false;
+    static void sendBorder(ServerPlayer p, double x, double z, double size) {
+        try {
+            Class<?> wbC = Class.forName("net.minecraft.world.level.border.WorldBorder");
+            Object wb = wbC.getConstructor().newInstance();
+            wbC.getMethod("setCenter", double.class, double.class).invoke(wb, x, z);
+            wbC.getMethod("setSize", double.class).invoke(wb, size);
+            Class<?> pk = Class.forName("net.minecraft.network.protocol.game.ClientboundInitializeBorderPacket");
+            Object pkt = pk.getConstructor(wbC).newInstance(wb);
+            p.connection.send((Packet<?>) pkt);
+        } catch (Throwable e) {
+            if (!borderWarned) { borderWarned = true; System.out.println("[Oneblox] Could not send the border packet: " + e); }
+        }
+    }
+
+    static void border(ServerPlayer p, Isl is) {
+        if (!inVoid(p)) return;
+        if (inHub(p.getX(), p.getZ())) sendBorder(p, data.hubX, data.hubZ, cfg.hubBorder * 2 + 1);
+        else sendBorder(p, cx(is.idx) + 0.5, cz(is.idx) + 0.5, cfg.radius * 2 + 1);
+    }
+
     // ---------- sidebar (one per player, using the 16 team-colour sidebar slots) ----------
     static final String[] COLORS = {"black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray",
             "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white"};
@@ -350,7 +378,7 @@ public class Oneblox implements ModInitializer {
         while (SLOT.containsValue(s) && s < 15) s++;
         SLOT.put(id, s);
         String c = COLORS[s];
-        run("scoreboard objectives add ob_" + s + " dummy {\"text\":\"ONEBLOX\",\"color\":\"gold\",\"bold\":true}");
+        run("scoreboard objectives add ob_" + s + " dummy {text:\"ONEBLOX\",color:\"gold\",bold:true}");
         run("scoreboard objectives setdisplay sidebar.team." + c + " ob_" + s);
         run("team add ob_" + s);
         run("team modify ob_" + s + " color " + c);
@@ -394,7 +422,11 @@ public class Oneblox implements ModInitializer {
             if (last != null && fish > last) pay(p, (long) (fish - last) * cfg.fishPay);
 
             enforce(p, is);
+            border(p, is);
             sidebar(p, is);
+            int ph = phase(is);
+            p.connection.send(new ClientboundSetActionBarTextPacket(Component.literal(
+                "\u00a76" + fmt(bal(p)) + " \u00a77| \u00a7bPhase " + (ph + 1) + " " + PHASE_NAME[ph])));
         }
         SLOT.keySet().removeIf(k -> !online.contains(k));   // free the slot of players who left
     }
@@ -432,7 +464,19 @@ public class Oneblox implements ModInitializer {
                 return 1;
             }))));
 
-        d.register(Commands.literal("spawn").executes(c -> { toHub(c.getSource().getPlayerOrException()); return 1; }));
+        LiteralCommandNode<CommandSourceStack> spawnNode =
+            d.register(Commands.literal("spawn").executes(c -> { toHub(c.getSource().getPlayerOrException()); return 1; }));
+        d.register(Commands.literal("hub").redirect(spawnNode));
+
+        d.register(Commands.literal("ob").executes(c -> {
+            ServerPlayer p = c.getSource().getPlayerOrException();
+            msg(p, "--- Oneblox help ---");
+            msg(p, "/is  go to your island      /spawn  go to the hub");
+            msg(p, "/is info  your phase        /is invite <player>  /is accept  /is leave");
+            msg(p, "/bal  /baltop  /pay <player> <amount>");
+            msg(p, "/spawners  /buyspawner <mob>   (earn money by mining, logs, fishing, killing mobs)");
+            return 1;
+        }));
 
         // ----- spawners -----
         d.register(Commands.literal("spawners").executes(c -> {
@@ -540,6 +584,11 @@ public class Oneblox implements ModInitializer {
                 data.hubSet = true; data.hubX = p.getX(); data.hubY = p.getY(); data.hubZ = p.getZ();
                 saveAll();
                 msg(p, "Hub set here.");
+                return 1;
+            }))
+            .then(Commands.literal("mode").executes(c -> {
+                ServerPlayer p = c.getSource().getPlayerOrException();
+                msg(p, "Oneblox mode: " + modeName() + " (void = own dimension, flat = void overworld, sky = fallback)");
                 return 1;
             }))
             .then(Commands.literal("addmoney")
