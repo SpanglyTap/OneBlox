@@ -39,7 +39,7 @@ import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.ChestMenu;
-import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.MenuType;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -256,10 +256,23 @@ public class Oneblox implements ModInitializer {
     }
     static void saveAll() { save("data.json", data); }
 
-    static void giveStack(ServerPlayer p, ItemStack st) {
-        ItemStack c = st.copy();
-        p.getInventory().add(c);
-        if (!c.isEmpty()) p.drop(c, false);
+    static void giveStack(ServerPlayer p, ItemStack st) { p.getInventory().add(st.copy()); }
+
+    static boolean hasSpace(ServerPlayer p) {
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < 36 && i < inv.getContainerSize(); i++) if (inv.getItem(i).isEmpty()) return true;
+        return false;
+    }
+
+    /** Shift-click? (looked up by name so a renamed enum constant can't break the build) */
+    static boolean shift(Object click) { return String.valueOf(click).contains("QUICK_MOVE"); }
+
+    /** Finds an item by field name (first match wins), or returns the fallback if this version has none of them. */
+    static Item item(Item fallback, String... names) {
+        for (String n : names) {
+            try { Object o = Items.class.getField(n).get(null); if (o instanceof Item it) return it; } catch (Throwable ignored) { }
+        }
+        return fallback;
     }
     static void sound(ServerPlayer p, String s) { run("playsound minecraft:" + s + " master " + p.getStringUUID()); }
 
@@ -291,7 +304,7 @@ public class Oneblox implements ModInitializer {
     // =====================================================================
     //  GUI FRAMEWORK (chest menus built on the server, players need no mod)
     // =====================================================================
-    interface Act { void run(ServerPlayer p, ClickType ct); }
+    interface Act { void run(ServerPlayer p, ContainerInput ct); }
 
     static MenuType<?> menuType(int rows) {
         switch (rows) {
@@ -312,7 +325,7 @@ public class Oneblox implements ModInitializer {
             return this;
         }
         Gui fill() {
-            for (int i = 0; i < rows * 9; i++) if (box.getItem(i).isEmpty()) box.setItem(i, icon(Items.GRAY_STAINED_GLASS_PANE, " "));
+            for (int i = 0; i < rows * 9; i++) if (box.getItem(i).isEmpty()) box.setItem(i, icon(item(Items.GLASS, "GRAY_STAINED_GLASS_PANE", "BLACK_STAINED_GLASS_PANE", "GLASS_PANE"), " "));
             return this;
         }
         void open(ServerPlayer p) {
@@ -327,7 +340,7 @@ public class Oneblox implements ModInitializer {
         GuiMenu(int id, Inventory inv, Gui g) { super(menuType(g.rows), id, inv, g.box, g.rows); this.g = g; }
 
         @Override
-        public void clicked(int slot, int button, ClickType ct, Player player) {
+        public void clicked(int slot, int button, ContainerInput ct, Player player) {
             if (slot >= 0 && slot < g.rows * 9 && g.acts[slot] != null && player instanceof ServerPlayer sp) {
                 try { g.acts[slot].run(sp, ct); } catch (Exception e) { e.printStackTrace(); }
             }
@@ -376,7 +389,7 @@ public class Oneblox implements ModInitializer {
     static Object[][] shop() {
         return new Object[][]{
             {"oak_log", Items.OAK_LOG, 6L}, {"oak_planks", Items.OAK_PLANKS, 2L}, {"cobblestone", Items.COBBLESTONE, 3L}, {"dirt", Items.DIRT, 2L},
-            {"sand", Items.SAND, 3L}, {"glass", Items.GLASS, 6L}, {"stone_bricks", Items.STONE_BRICKS, 6L}, {"white_wool", Items.WHITE_WOOL, 10L},
+            {"sand", Items.SAND, 3L}, {"glass", Items.GLASS, 6L}, {"stone_bricks", Items.STONE_BRICKS, 6L}, {"white_wool", item(Items.GLASS, "WHITE_WOOL"), 10L},
             {"torch", Items.TORCH, 3L}, {"bread", Items.BREAD, 6L}, {"cooked_beef", Items.COOKED_BEEF, 12L}, {"golden_apple", Items.GOLDEN_APPLE, 600L},
             {"bone_meal", Items.BONE_MEAL, 20L}, {"oak_sapling", Items.OAK_SAPLING, 15L}, {"wheat_seeds", Items.WHEAT_SEEDS, 5L},
             {"sugar_cane", Items.SUGAR_CANE, 12L}, {"bucket", Items.BUCKET, 100L}, {"water_bucket", Items.WATER_BUCKET, 150L},
@@ -393,7 +406,7 @@ public class Oneblox implements ModInitializer {
             Item it = (Item) shop[i][1];
             long price = (Long) shop[i][2];
             g.set(i, icon(it, "\u00a7f" + pretty(id), "\u00a77Price: \u00a7a" + fmt(price) + " each", "\u00a78Click: buy 1  |  Shift-click: buy 16"),
-                (pl, ct) -> { buyItem(pl, id, price, ct == ClickType.QUICK_MOVE ? 16 : 1); });
+                (pl, ct) -> { buyItem(pl, id, price, shift(ct) ? 16 : 1); });
         }
         g.set(49, backIcon(), (pl, ct) -> openMain(pl));
         g.open(p);
@@ -490,6 +503,7 @@ public class Oneblox implements ModInitializer {
         if (l == null) { msg(p, "\u00a7cThat listing is gone."); openAuction(p, back); return; }
         ItemStack st = deser(l.json);
         if (st.isEmpty()) { data.auctions.remove(l); openAuction(p, back); return; }
+        if (!hasSpace(p)) { msg(p, "\u00a7cFree an inventory slot first."); return; }
         if (l.seller.equals(p.getStringUUID())) {
             data.auctions.remove(l);
             giveStack(p, st);
@@ -594,7 +608,7 @@ public class Oneblox implements ModInitializer {
             lore.add("\u00a7aShift-click: buy a key");
             String cr = crate;
             g.set(slots[n], icon(ci[n], "\u00a7d" + crate + " Crate", lore.toArray(new String[0])),
-                (pl, ct) -> { if (ct == ClickType.QUICK_MOVE) buyKey(pl, cr); else openCrate(pl, cr); });
+                (pl, ct) -> { if (shift(ct)) buyKey(pl, cr); else openCrate(pl, cr); });
             n++;
         }
         g.set(22, backIcon(), (pl, ct) -> openMain(pl));
@@ -733,9 +747,9 @@ public class Oneblox implements ModInitializer {
         Isl is = islandOf(p.getStringUUID());
         if (is == null || !is.owner.equals(p.getStringUUID())) { msg(p, "\u00a7cOnly the island owner can do that."); return; }
         Gui g = new Gui("\u00a78Island Permissions", 3).fill();
-        g.set(11, icon(is.memberBuild ? Items.LIME_DYE : Items.RED_DYE, "\u00a7fMembers can build: " + (is.memberBuild ? "\u00a7aYES" : "\u00a7cNO"),
+        g.set(11, icon(is.memberBuild ? item(Items.EMERALD, "LIME_DYE", "GREEN_DYE") : item(Items.REDSTONE, "RED_DYE"), "\u00a7fMembers can build: " + (is.memberBuild ? "\u00a7aYES" : "\u00a7cNO"),
             "\u00a77Break and place blocks on the island", "\u00a78Click to toggle"), (pl, ct) -> { is.memberBuild = !is.memberBuild; saveAll(); openPermissions(pl); });
-        g.set(15, icon(is.memberInvite ? Items.LIME_DYE : Items.RED_DYE, "\u00a7fMembers can invite: " + (is.memberInvite ? "\u00a7aYES" : "\u00a7cNO"),
+        g.set(15, icon(is.memberInvite ? item(Items.EMERALD, "LIME_DYE", "GREEN_DYE") : item(Items.REDSTONE, "RED_DYE"), "\u00a7fMembers can invite: " + (is.memberInvite ? "\u00a7aYES" : "\u00a7cNO"),
             "\u00a77Invite new people to the island", "\u00a78Click to toggle"), (pl, ct) -> { is.memberInvite = !is.memberInvite; saveAll(); openPermissions(pl); });
         g.set(22, icon(Items.ARROW, "\u00a7eBack"), (pl, ct) -> openIslandPanel(pl));
         g.open(p);
