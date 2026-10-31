@@ -17,6 +17,12 @@ dependencies {
 processResources {
     inputs.property "version", project.version
     filesMatching("fabric.mod.json") { expand "version": project.version }
+    // the empty "oneblox:void" dimension is written by the build itself, so there is no file to misplace
+    doLast {
+        def f = layout.buildDirectory.file("resources/main/data/oneblox/dimension/void.json").get().asFile
+        f.parentFile.mkdirs()
+        f.text = '{"type":"minecraft:overworld","generator":{"type":"minecraft:flat","settings":{"biome":"minecraft:the_void","features":false,"lakes":false,"layers":[],"structure_overrides":[]}}}'
+    }
 }
 
 tasks.withType(JavaCompile).configureEach {
