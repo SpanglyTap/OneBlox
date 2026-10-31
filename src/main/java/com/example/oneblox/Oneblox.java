@@ -25,7 +25,6 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.stats.Stats;
 import net.minecraft.world.entity.Mob;
-import net.minecraft.world.level.Level;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -64,6 +63,7 @@ public class Oneblox implements ModInitializer {
     }
 
     static class Data {
+        int ver = 0;
         int nextIsland = 0;
         boolean hubSet = false; double hubX = 0.5, hubY = 64, hubZ = 0.5;
         Map<String, Long> money = new HashMap<>();
@@ -72,6 +72,7 @@ public class Oneblox implements ModInitializer {
         Map<Integer, Isl> islands = new HashMap<>();
     }
 
+    static final String DIM = "oneblox:void";   // our own empty dimension (see data/oneblox/dimension/void.json)
     static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     static final Random RNG = new Random();
     static MinecraftServer server;
@@ -147,8 +148,14 @@ public class Oneblox implements ModInitializer {
         } catch (Exception e) { e.printStackTrace(); }
     }
 
+    /** Runs a command inside the void dimension. */
+    static void runIn(String cmd) { run("execute in " + DIM + " run " + cmd); }
+
+    static boolean inVoid(ServerPlayer p) { return String.valueOf(p.level().dimension()).contains(DIM); }
+    static boolean inOverworld(ServerPlayer p) { return String.valueOf(p.level().dimension()).contains("minecraft:overworld"); }
+
     static void tp(ServerPlayer p, double x, double y, double z) {
-        run("execute in minecraft:overworld run tp " + p.getStringUUID() + " " + x + " " + y + " " + z);
+        run("execute in " + DIM + " run tp " + p.getStringUUID() + " " + x + " " + y + " " + z);
     }
 
     // delayed tasks
@@ -195,18 +202,18 @@ public class Oneblox implements ModInitializer {
         data.islandOf.put(id, idx);
         int x = cx(idx), z = cz(idx), R = cfg.radius;
         msg(p, "Building your island, one moment...");
-        run("forceload add " + (x - R) + " " + (z - R) + " " + (x + R) + " " + (z + R));
+        runIn("forceload add " + (x - R) + " " + (z - R) + " " + (x + R) + " " + (z + R));
         later(40, () -> {
-            run("fill " + (x - 2) + " 63 " + (z - 2) + " " + (x + 2) + " 63 " + (z + 2) + " minecraft:grass_block");
-            run("setblock " + x + " 64 " + z + " minecraft:grass_block");
+            runIn("fill " + (x - 2) + " 63 " + (z - 2) + " " + (x + 2) + " 63 " + (z + 2) + " minecraft:grass_block");
+            runIn("setblock " + x + " 64 " + z + " minecraft:grass_block");
             String g = " minecraft:red_stained_glass";
-            run("fill " + (x - R) + " 58 " + (z - R) + " " + (x + R) + " 72 " + (z - R) + g);
-            run("fill " + (x - R) + " 58 " + (z + R) + " " + (x + R) + " 72 " + (z + R) + g);
-            run("fill " + (x - R) + " 58 " + (z - R) + " " + (x - R) + " 72 " + (z + R) + g);
-            run("fill " + (x + R) + " 58 " + (z - R) + " " + (x + R) + " 72 " + (z + R) + g);
+            runIn("fill " + (x - R) + " 58 " + (z - R) + " " + (x + R) + " 72 " + (z - R) + g);
+            runIn("fill " + (x - R) + " 58 " + (z + R) + " " + (x + R) + " 72 " + (z + R) + g);
+            runIn("fill " + (x - R) + " 58 " + (z - R) + " " + (x - R) + " 72 " + (z + R) + g);
+            runIn("fill " + (x + R) + " 58 " + (z - R) + " " + (x + R) + " 72 " + (z + R) + g);
         });
         later(50, () -> { tp(p, x + 0.5, 64, z + 3.5); is.ready = true; msg(p, "Welcome to your island! Break the grass block."); });
-        later(120, () -> run("forceload remove " + (x - R) + " " + (z - R) + " " + (x + R) + " " + (z + R)));
+        later(120, () -> runIn("forceload remove " + (x - R) + " " + (z - R) + " " + (x + R) + " " + (z + R)));
         saveAll();
     }
 
@@ -218,7 +225,7 @@ public class Oneblox implements ModInitializer {
             String[] m = PHASE_MOBS[ph];
             b = "minecraft:spawner{SpawnData:{entity:{id:\"minecraft:" + m[RNG.nextInt(m.length)] + "\"}}}";
         }
-        run("setblock " + cx(is.idx) + " 64 " + cz(is.idx) + " " + b + " keep");
+        runIn("setblock " + cx(is.idx) + " 64 " + cz(is.idx) + " " + b + " keep");
     }
 
     static void tellIsland(Isl is, String s) {
@@ -240,8 +247,9 @@ public class Oneblox implements ModInitializer {
 
     /** Keeps players inside their own island (or the hub) and out of the void. */
     static void enforce(ServerPlayer p, Isl is) {
-        if (p.level().dimension() != Level.OVERWORLD || isAdmin(p)) return;
         if (is == null || !is.ready) return;
+        if (inOverworld(p)) { toHome(p); return; }   // respawned or wandered into the normal overworld: back to the void
+        if (!inVoid(p) || isAdmin(p)) return;
         double x = p.getX(), z = p.getZ();
         if (p.getY() < -10) { toHome(p); return; }
         if (inHub(x, z)) return;
@@ -253,14 +261,9 @@ public class Oneblox implements ModInitializer {
 
     static void buildHub() {
         if (data.hubSet) return;
-        var level = server.overworld();
-        if (!level.getBlockState(new BlockPos(0, 63, 0)).isAir()) {
-            System.out.println("[Oneblox] Something already exists at 0,63,0 (a map?). Use /oneblox setspawn to set the hub.");
-            return;
-        }
-        run("forceload add -25 -25 25 25");
-        later(40, () -> run("fill -20 63 -20 20 63 20 minecraft:stone_bricks"));
-        later(120, () -> run("forceload remove -25 -25 25 25"));
+        runIn("forceload add -25 -25 25 25");
+        later(40, () -> runIn("fill -20 63 -20 20 63 20 minecraft:stone_bricks"));
+        later(120, () -> runIn("forceload remove -25 -25 25 25"));
         data.hubSet = true; data.hubX = 0.5; data.hubY = 64; data.hubZ = 0.5;
         saveAll();
     }
@@ -273,6 +276,7 @@ public class Oneblox implements ModInitializer {
             dir = FabricLoader.getInstance().getConfigDir().resolve("oneblox");
             cfg = load("config.json", Cfg.class, new Cfg());
             data = load("data.json", Data.class, new Data());
+            if (data.ver != 2) { data = new Data(); data.ver = 2; }   // old test data from before the void dimension: start fresh
             save("config.json", cfg);
             buildHub();
         });
@@ -290,13 +294,13 @@ public class Oneblox implements ModInitializer {
 
         // mining + tree cutting; also drives the OneBlock
         PlayerBlockBreakEvents.BEFORE.register((world, player, pos, state, be) -> {
-            if (!(player instanceof ServerPlayer sp) || isAdmin(sp)) return true;
+            if (!(player instanceof ServerPlayer sp) || isAdmin(sp) || !inVoid(sp)) return true;
             return canBuild(sp, pos);
         });
         PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, be) -> {
             if (!(player instanceof ServerPlayer sp)) return;
             Isl is = islandOf(sp.getStringUUID());
-            boolean one = is != null && pos.getX() == cx(is.idx) && pos.getY() == 64 && pos.getZ() == cz(is.idx);
+            boolean one = is != null && inVoid(sp) && pos.getX() == cx(is.idx) && pos.getY() == 64 && pos.getZ() == cz(is.idx);
             String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
             pay(sp, blockPay(id, one));
             if (!one) return;
@@ -307,7 +311,7 @@ public class Oneblox implements ModInitializer {
             later(1, () -> placeNext(fis));
             if (RNG.nextInt(100) < cfg.mobChance) {
                 String[] m = PHASE_MOBS[phase(is)];
-                run("summon minecraft:" + m[RNG.nextInt(m.length)] + " " + (cx(is.idx) + 0.5) + " 65 " + (cz(is.idx) + 0.5));
+                runIn("summon minecraft:" + m[RNG.nextInt(m.length)] + " " + (cx(is.idx) + 0.5) + " 65 " + (cz(is.idx) + 0.5));
             }
         });
 
