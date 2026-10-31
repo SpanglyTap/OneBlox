@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "oneblox",
+  "version": "${version}",
+  "name": "Oneblox",
+  "description": "OneBlock islands, money, spawners. Server-side, no client mod needed.",
+  "authors": ["you"],
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.example.oneblox.Oneblox"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
