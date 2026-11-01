@@ -17,6 +17,7 @@ import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
 import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.commands.CommandSourceStack;
@@ -33,8 +34,10 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.stats.Stats;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.SimpleMenuProvider;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
@@ -79,6 +82,13 @@ public class Oneblox implements ModInitializer {
         Map<String, Long> sell = new LinkedHashMap<>();          // item id -> sell price each
         Map<String, Long> keyPrice = new LinkedHashMap<>();      // crate -> key price
         Map<String, List<Reward>> crates = new LinkedHashMap<>();
+        List<BM> blackMarket = new ArrayList<>(List.of(
+            new BM("item", "netherite_ingot", 1, "gems", 40), new BM("item", "nether_star", 1, "gems", 60), new BM("item", "elytra", 1, "gems", 120),
+            new BM("item", "totem_of_undying", 1, "gems", 50), new BM("item", "enchanted_golden_apple", 2, "gems", 30), new BM("item", "diamond_block", 4, "gems", 25),
+            new BM("item", "beacon", 1, "gems", 80), new BM("spawner", "blaze", 1, "gems", 90), new BM("spawner", "enderman", 1, "gems", 70),
+            new BM("spawner", "iron_golem", 1, "gems", 110), new BM("key", "Mythic", 1, "gems", 25), new BM("key", "Infinity", 2, "gems", 20),
+            new BM("item", "experience_bottle", 64, "coins", 200), new BM("item", "golden_carrot", 64, "coins", 150),
+            new BM("item", "ender_pearl", 16, "coins", 120), new BM("item", "shulker_box", 1, "coins", 300)));
 
         Cfg() {
             ranks.put("member", ""); ranks.put("chicken", "\u00a7f[Chicken] "); ranks.put("parrot", "\u00a7c[Parrot] "); ranks.put("allay", "\u00a7b[Allay] ");
@@ -111,6 +121,12 @@ public class Oneblox implements ModInitializer {
         }
     }
 
+    static class Mail { String kind, payload, label; }          // kind: "stack" (item json) or "cmd" (give command with %P%)
+    static class BM {                                            // black market offer
+        String type, value, cur; int amount; long price;       // type: item | spawner | key   cur: gems | coins
+        BM(String type, String value, int amount, String cur, long price) { this.type = type; this.value = value; this.amount = amount; this.cur = cur; this.price = price; }
+    }
+
     static class Listing {
         int id; String seller, sellerName, json, name; long price; int count; long time;
     }
@@ -127,6 +143,9 @@ public class Oneblox implements ModInitializer {
         boolean hubSet = false; double hubX = 0.5, hubY = 64, hubZ = 0.5;
         Set<String> kit = new HashSet<>();
         Map<String, Long> money = new HashMap<>();
+        Map<String, Long> coins = new HashMap<>();
+        Map<String, Long> gems = new HashMap<>();
+        Map<String, List<Mail>> mail = new HashMap<>();
         Map<String, String> names = new HashMap<>();
         Map<String, String> rank = new HashMap<>();
         Map<String, Long> lastDaily = new HashMap<>();
@@ -203,6 +222,16 @@ public class Oneblox implements ModInitializer {
     static String fmt(long v) { return "$" + String.format(Locale.US, "%,d", v); }
     static long bal(ServerPlayer p) { return data.money.getOrDefault(p.getStringUUID(), 0L); }
     static void add(ServerPlayer p, long a) { data.money.merge(p.getStringUUID(), a, Long::sum); }
+    static long coinsOf(ServerPlayer p) { return data.coins.getOrDefault(p.getStringUUID(), 0L); }
+    static long gemsOf(ServerPlayer p) { return data.gems.getOrDefault(p.getStringUUID(), 0L); }
+    static void addCoins(ServerPlayer p, long a) { data.coins.merge(p.getStringUUID(), a, Long::sum); }
+    static void addGems(ServerPlayer p, long a) { data.gems.merge(p.getStringUUID(), a, Long::sum); }
+    static String shortNum(long v) {
+        if (v >= 1_000_000_000L) return String.format(Locale.US, "%.2fB", v / 1e9);
+        if (v >= 1_000_000L) return String.format(Locale.US, "%.2fM", v / 1e6);
+        if (v >= 10_000L) return String.format(Locale.US, "%.1fK", v / 1e3);
+        return String.format(Locale.US, "%,d", v);
+    }
     static String pretty(String id) {
         StringBuilder sb = new StringBuilder();
         for (String w : id.split("_")) { if (w.isEmpty()) continue; if (sb.length() > 0) sb.append(' '); sb.append(Character.toUpperCase(w.charAt(0))).append(w.substring(1)); }
@@ -274,7 +303,55 @@ public class Oneblox implements ModInitializer {
         }
         return fallback;
     }
-    static void sound(ServerPlayer p, String s) { run("playsound minecraft:" + s + " master " + p.getStringUUID()); }
+    static void sound(ServerPlayer p, String s) { run("playsound minecraft:" + s + " master " + p.getName().getString()); }
+
+    // ---- delivery: items go to the inventory, or to /mailbox when it is full (never dropped) ----
+    static void addMail(String uuid, String kind, String payload, String label) {
+        Mail m = new Mail();
+        m.kind = kind; m.payload = payload; m.label = label;
+        data.mail.computeIfAbsent(uuid, k -> new ArrayList<>()).add(m);
+    }
+    /** tmpl is a give command with %P% where the player name goes, e.g. "give %P% minecraft:diamond 8". */
+    static void deliverGive(ServerPlayer p, String tmpl, String label) {
+        if (hasSpace(p)) run(tmpl.replace("%P%", p.getName().getString()));
+        else { addMail(p.getStringUUID(), "cmd", tmpl, label); msg(p, "\u00a7eInventory full - " + label + " was sent to /mailbox"); }
+    }
+    static void deliverStack(ServerPlayer p, ItemStack st, String label) {
+        if (hasSpace(p)) { giveStack(p, st); return; }
+        String j = ser(st);
+        if (j != null) { addMail(p.getStringUUID(), "stack", j, label); msg(p, "\u00a7eInventory full - " + label + " was sent to /mailbox"); }
+    }
+    static boolean claimMail(ServerPlayer p, Mail m) {
+        if (!hasSpace(p)) { msg(p, "\u00a7cFree an inventory slot first."); return false; }
+        if (m.kind.equals("stack")) { ItemStack st = deser(m.payload); if (!st.isEmpty()) giveStack(p, st); }
+        else run(m.payload.replace("%P%", p.getName().getString()));
+        List<Mail> l = data.mail.get(p.getStringUUID());
+        if (l != null) l.remove(m);
+        return true;
+    }
+    static String uuidByName(String name) {
+        for (Map.Entry<String, String> e : data.names.entrySet()) if (e.getValue().equalsIgnoreCase(name)) return e.getKey();
+        return null;
+    }
+    static String spawnerGive(String mob) {
+        return "give %P% minecraft:spawner[block_entity_data={id:\"minecraft:mob_spawner\",SpawnData:{entity:{id:\"minecraft:" + mob + "\"}}}] 1";
+    }
+    /** Looks an item up by id ("diamond_block") through the Items class; null if this version has no such item. */
+    static Item itemById(String id) {
+        try { Object o = Items.class.getField(id.toUpperCase(Locale.ROOT)).get(null); return o instanceof Item it ? it : null; }
+        catch (Throwable e) { return null; }
+    }
+    static Item itemOr(String id, Item fallback) { Item it = itemById(id); return it == null ? fallback : it; }
+
+    // ---- the menu item in the last hotbar slot ----
+    static ItemStack menuItem() { return icon(Items.NETHER_STAR, "\u00a7aMenu \u00a77(Right Click)", "\u00a77Opens the Oneblox menu"); }
+    static boolean isMenuItem(ItemStack st) { return !st.isEmpty() && st.getItem() == Items.NETHER_STAR && st.getHoverName().getString().contains("Menu"); }
+    static void ensureMenuItem(ServerPlayer p) {
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) if (isMenuItem(inv.getItem(i))) return;
+        if (inv.getItem(8).isEmpty()) inv.setItem(8, menuItem());
+        else if (hasSpace(p)) giveStack(p, menuItem());
+    }
 
     // item <-> text (for the auction house)
     static String ser(ItemStack st) {
@@ -367,18 +444,22 @@ public class Oneblox implements ModInitializer {
     //  MAIN MENU
     // =====================================================================
     static void openMain(ServerPlayer p) {
-        Gui g = new Gui("\u00a78Oneblox", 3).fill();
-        g.set(4, icon(Items.GOLD_NUGGET, "\u00a76" + fmt(bal(p)), "\u00a77Rank: \u00a7f" + pretty(rankId(p))), null);
+        Gui g = new Gui("\u00a78Oneblox", 4).fill();
+        int mails = data.mail.getOrDefault(p.getStringUUID(), List.of()).size();
+        g.set(4, icon(Items.GOLD_NUGGET, "\u00a76" + p.getName().getString(), "\u00a76Money: \u00a7f" + fmt(bal(p)), "\u00a7eCoins: \u00a7f" + shortNum(coinsOf(p)),
+            "\u00a7dGems: \u00a7f" + shortNum(gemsOf(p)), "\u00a77Rank: \u00a7f" + pretty(rankId(p))), null);
         g.set(10, icon(Items.GRASS_BLOCK, "\u00a7aMy island", "\u00a77Click to teleport"), (pl, ct) -> { pl.closeContainer(); toHome(pl); });
         g.set(11, icon(Items.EMERALD, "\u00a7aShop", "\u00a77Buy blocks, food and tools"), (pl, ct) -> openShop(pl));
         g.set(12, icon(Items.GOLD_INGOT, "\u00a76Sell", "\u00a77Sell your items for money"), (pl, ct) -> openSell(pl));
         g.set(13, icon(Items.CHEST, "\u00a7eAuction house", "\u00a77Buy and sell with other players"), (pl, ct) -> openAuction(pl, 0));
         g.set(14, icon(Items.ENDER_CHEST, "\u00a7dCrates", "\u00a77Open crates with keys"), (pl, ct) -> openCrates(pl));
         g.set(15, icon(Items.SPAWNER, "\u00a7cSpawners", "\u00a77Buy mob spawners"), (pl, ct) -> openSpawners(pl));
-        g.set(16, icon(Items.NETHER_STAR, "\u00a7bDaily reward", "\u00a77Free money and a key every 24h"), (pl, ct) -> claimDaily(pl));
-        g.set(19, icon(Items.COMPASS, "\u00a7fHub", "\u00a77Go to spawn"), (pl, ct) -> { pl.closeContainer(); toHub(pl); });
-        g.set(20, icon(Items.BOOK, "\u00a7fLeaderboards", "\u00a77Richest players and top islands"), (pl, ct) -> openTop(pl));
-        g.set(21, icon(Items.BARREL, "\u00a7fIsland panel", "\u00a77Members and permissions"), (pl, ct) -> openIslandPanel(pl));
+        g.set(16, icon(Items.NETHER_STAR, "\u00a75Black market", "\u00a77Rare items for gems and coins", "\u00a77Stock changes every hour"), (pl, ct) -> openBlackMarket(pl));
+        g.set(19, icon(Items.CLOCK, "\u00a7bDaily reward", "\u00a77Money, coins, gems and a key"), (pl, ct) -> claimDaily(pl));
+        g.set(20, icon(Items.BARREL, "\u00a7fMailbox", mails > 0 ? "\u00a7aYou have " + mails + " item(s)!" : "\u00a77Empty", "\u00a78Gifts and items that did not fit"), (pl, ct) -> openMailbox(pl));
+        g.set(21, icon(Items.BOOK, "\u00a7fLeaderboards", "\u00a77Richest players and top islands"), (pl, ct) -> openTop(pl));
+        g.set(22, icon(Items.PLAYER_HEAD, "\u00a7fIsland panel", "\u00a77Members and permissions"), (pl, ct) -> openIslandPanel(pl));
+        g.set(23, icon(Items.COMPASS, "\u00a7fHub", "\u00a77Go to spawn"), (pl, ct) -> { pl.closeContainer(); toHub(pl); });
         if (isAdmin(p)) g.set(25, icon(Items.COMMAND_BLOCK, "\u00a74Admin panel", "\u00a77Owner only"), (pl, ct) -> openAdmin(pl));
         g.open(p);
     }
@@ -386,29 +467,38 @@ public class Oneblox implements ModInitializer {
     // =====================================================================
     //  SHOP + SELL
     // =====================================================================
-    static Object[][] shop() {
-        return new Object[][]{
-            {"oak_log", Items.OAK_LOG, 6L}, {"oak_planks", Items.OAK_PLANKS, 2L}, {"cobblestone", Items.COBBLESTONE, 3L}, {"dirt", Items.DIRT, 2L},
-            {"sand", Items.SAND, 3L}, {"glass", Items.GLASS, 6L}, {"stone_bricks", Items.STONE_BRICKS, 6L}, {"white_wool", item(Items.GLASS, "WHITE_WOOL"), 10L},
-            {"torch", Items.TORCH, 3L}, {"bread", Items.BREAD, 6L}, {"cooked_beef", Items.COOKED_BEEF, 12L}, {"golden_apple", Items.GOLDEN_APPLE, 600L},
-            {"bone_meal", Items.BONE_MEAL, 20L}, {"oak_sapling", Items.OAK_SAPLING, 15L}, {"wheat_seeds", Items.WHEAT_SEEDS, 5L},
-            {"sugar_cane", Items.SUGAR_CANE, 12L}, {"bucket", Items.BUCKET, 100L}, {"water_bucket", Items.WATER_BUCKET, 150L},
-            {"lava_bucket", Items.LAVA_BUCKET, 300L}, {"iron_pickaxe", Items.IRON_PICKAXE, 250L}, {"diamond_pickaxe", Items.DIAMOND_PICKAXE, 2500L},
-            {"ender_pearl", Items.ENDER_PEARL, 300L}, {"experience_bottle", Items.EXPERIENCE_BOTTLE, 150L}
-        };
-    }
+    /** category, icon item id, "item:price,item:price,..." */
+    static String[][] SHOP_CATS = {
+        {"Blocks", "grass_block", "oak_log:6,oak_planks:2,cobblestone:3,dirt:2,sand:3,gravel:3,glass:6,stone_bricks:6,bricks:15,sandstone:6,white_wool:10,torch:3,oak_door:8,ladder:5"},
+        {"Farming", "wheat", "wheat_seeds:5,carrot:8,potato:8,melon_seeds:10,pumpkin_seeds:10,sugar_cane:12,oak_sapling:15,bone_meal:20,hay_block:40,bucket:100,water_bucket:150"},
+        {"Food", "cooked_beef", "bread:6,cooked_beef:12,cooked_porkchop:12,cooked_chicken:10,baked_potato:8,golden_carrot:60,golden_apple:600,cake:100"},
+        {"Tools", "iron_pickaxe", "iron_pickaxe:250,iron_axe:250,iron_shovel:120,iron_sword:300,diamond_pickaxe:2500,diamond_axe:2500,diamond_sword:3000,fishing_rod:80,shears:120,lava_bucket:300"},
+        {"Redstone", "redstone", "redstone:10,repeater:40,comparator:60,piston:80,sticky_piston:120,observer:80,hopper:100,dispenser:90,lever:8,redstone_torch:12"},
+        {"Misc", "ender_pearl", "ender_pearl:300,experience_bottle:150,name_tag:200,saddle:500,lead:40,chest:30,furnace:20,crafting_table:10,anvil:400,enchanting_table:1500"}
+    };
 
     static void openShop(ServerPlayer p) {
-        Gui g = new Gui("\u00a78Shop  -  " + fmt(bal(p)), 6).fill();
-        Object[][] shop = shop();
-        for (int i = 0; i < shop.length && i < 45; i++) {
-            String id = (String) shop[i][0];
-            Item it = (Item) shop[i][1];
-            long price = (Long) shop[i][2];
-            g.set(i, icon(it, "\u00a7f" + pretty(id), "\u00a77Price: \u00a7a" + fmt(price) + " each", "\u00a78Click: buy 1  |  Shift-click: buy 16"),
-                (pl, ct) -> { buyItem(pl, id, price, shift(ct) ? 16 : 1); });
+        Gui g = new Gui("\u00a78Shop  -  " + fmt(bal(p)), 3).fill();
+        int[] slots = {10, 11, 12, 14, 15, 16};
+        for (int i = 0; i < SHOP_CATS.length && i < slots.length; i++) {
+            int ci = i;
+            g.set(slots[i], icon(itemOr(SHOP_CATS[i][1], Items.CHEST), "\u00a7a" + SHOP_CATS[i][0], "\u00a77Click to browse"), (pl, ct) -> openShopCat(pl, ci));
         }
-        g.set(49, backIcon(), (pl, ct) -> openMain(pl));
+        g.set(22, backIcon(), (pl, ct) -> openMain(pl));
+        g.open(p);
+    }
+
+    static void openShopCat(ServerPlayer p, int ci) {
+        Gui g = new Gui("\u00a78Shop: " + SHOP_CATS[ci][0] + "  -  " + fmt(bal(p)), 6).fill();
+        String[] entries = SHOP_CATS[ci][2].split(",");
+        for (int i = 0; i < entries.length && i < 45; i++) {
+            String[] e = entries[i].split(":");
+            String id = e[0];
+            long price = Long.parseLong(e[1]);
+            g.set(i, icon(itemOr(id, Items.CHEST), "\u00a7f" + pretty(id), "\u00a77Price: \u00a7a" + fmt(price) + " each", "\u00a78Click: buy 1  |  Shift-click: buy 16"),
+                (pl, ct) -> buyItem(pl, id, price, shift(ct) ? 16 : 1));
+        }
+        g.set(49, icon(Items.ARROW, "\u00a7eBack to shop"), (pl, ct) -> openShop(pl));
         g.open(p);
     }
 
@@ -416,7 +506,7 @@ public class Oneblox implements ModInitializer {
         long cost = price * n;
         if (bal(p) < cost) { msg(p, "\u00a7cYou need " + fmt(cost)); return; }
         add(p, -cost);
-        run("give " + p.getStringUUID() + " minecraft:" + id + " " + n);
+        deliverGive(p, "give %P% minecraft:" + id + " " + n, n + "x " + pretty(id));
         msg(p, "\u00a7aBought " + n + "x " + pretty(id) + " for " + fmt(cost));
     }
 
@@ -503,10 +593,9 @@ public class Oneblox implements ModInitializer {
         if (l == null) { msg(p, "\u00a7cThat listing is gone."); openAuction(p, back); return; }
         ItemStack st = deser(l.json);
         if (st.isEmpty()) { data.auctions.remove(l); openAuction(p, back); return; }
-        if (!hasSpace(p)) { msg(p, "\u00a7cFree an inventory slot first."); return; }
         if (l.seller.equals(p.getStringUUID())) {
             data.auctions.remove(l);
-            giveStack(p, st);
+            deliverStack(p, st, l.count + "x " + l.name);
             msg(p, "\u00a7eListing cancelled, item returned.");
             saveAll();
             openAuction(p, back);
@@ -519,7 +608,7 @@ public class Oneblox implements ModInitializer {
         data.money.merge(l.seller, net, Long::sum);
         ServerPlayer seller = server.getPlayerList().getPlayer(UUID.fromString(l.seller));
         if (seller != null) msg(seller, "\u00a7aYour " + l.name + " sold for " + fmt(net));
-        giveStack(p, st);
+        deliverStack(p, st, l.count + "x " + l.name);
         msg(p, "\u00a7aBought " + l.name + " for " + fmt(l.price));
         saveAll();
         openAuction(p, back);
@@ -561,13 +650,16 @@ public class Oneblox implements ModInitializer {
     static String rewardName(Reward r) {
         switch (r.type) {
             case "money": return "\u00a7a" + fmt(r.amount);
+            case "coins": return "\u00a7e" + r.amount + " Coins";
+            case "gems": return "\u00a7d" + r.amount + " Gems";
             case "item": return "\u00a7f" + r.amount + "x " + pretty(r.value);
             case "spawner": return "\u00a7c" + pretty(r.value) + " Spawner";
             default: return "\u00a76" + r.amount + "x " + r.value + " Key";
         }
     }
     static ItemStack rewardIcon(Reward r) {
-        Item it = r.type.equals("money") ? Items.EMERALD : r.type.equals("spawner") ? Items.SPAWNER : r.type.equals("key") ? Items.TRIPWIRE_HOOK : Items.CHEST;
+        Item it = r.type.equals("money") ? Items.EMERALD : r.type.equals("spawner") ? Items.SPAWNER : r.type.equals("key") ? Items.TRIPWIRE_HOOK
+            : (r.type.equals("coins") || r.type.equals("gems")) ? Items.GOLD_NUGGET : itemOr(r.value, Items.CHEST);
         return icon(it, rewardName(r));
     }
     static Reward pickReward(List<Reward> pool) {
@@ -578,13 +670,12 @@ public class Oneblox implements ModInitializer {
         return pool.get(0);
     }
     static void giveReward(ServerPlayer p, Reward r) {
-        String u = p.getStringUUID();
         switch (r.type) {
             case "money": pay(p, r.amount); break;
-            case "item": run("give " + u + " minecraft:" + r.value + " " + r.amount); break;
-            case "spawner":
-                run("give " + u + " minecraft:spawner[block_entity_data={id:\"minecraft:mob_spawner\",SpawnData:{entity:{id:\"minecraft:" + r.value + "\"}}}] 1");
-                break;
+            case "coins": addCoins(p, r.amount); break;
+            case "gems": addGems(p, r.amount); break;
+            case "item": deliverGive(p, "give %P% minecraft:" + r.value + " " + r.amount, r.amount + "x " + pretty(r.value)); break;
+            case "spawner": deliverGive(p, spawnerGive(r.value), pretty(r.value) + " Spawner"); break;
             default: addKey(p, r.value, r.amount);
         }
     }
@@ -638,6 +729,11 @@ public class Oneblox implements ModInitializer {
                 if (p.containerMenu instanceof GuiMenu gm && gm.g == g) {
                     Reward r = step == 12 ? win : pool.get(RNG.nextInt(pool.size()));
                     g.box.setItem(13, rewardIcon(r));
+                    if (step == 12) {
+                        g.set(11, icon(Items.TRIPWIRE_HOOK, "\u00a7aOpen again", "\u00a77Keys left: \u00a7f" + keyCount(p, crate)), (pl, ct) -> openCrate(pl, crate));
+                        g.set(15, icon(Items.ENDER_CHEST, "\u00a7eBack to crates"), (pl, ct) -> openCrates(pl));
+                        g.set(22, icon(Items.BARRIER, "\u00a7cClose"), (pl, ct) -> pl.closeContainer());
+                    }
                     gm.broadcastChanges();
                     sound(p, step == 12 ? "entity.player.levelup" : "ui.button.click");
                 }
@@ -664,7 +760,7 @@ public class Oneblox implements ModInitializer {
         if (price == null) { msg(p, "\u00a7cUnknown mob. Open /menu, Spawners."); return; }
         if (bal(p) < price) { msg(p, "\u00a7cYou need " + fmt(price)); return; }
         add(p, -price);
-        giveReward(p, new Reward("spawner", mob, 1, 1));
+        giveReward(p, new Reward("spawner", mob, 1, 1));   // goes to /mailbox if the inventory is full
         msg(p, "\u00a7aBought a " + pretty(mob) + " spawner for " + fmt(price));
     }
 
@@ -678,9 +774,100 @@ public class Oneblox implements ModInitializer {
         }
         data.lastDaily.put(p.getStringUUID(), now);
         add(p, cfg.dailyMoney);
+        addCoins(p, 10);
+        addGems(p, 5);
         addKey(p, "Panda", 1);
-        msg(p, "\u00a76Daily reward: " + fmt(cfg.dailyMoney) + " and a Panda key!");
+        msg(p, "\u00a76Daily: " + fmt(cfg.dailyMoney) + ", 10 coins, 5 gems and a Panda key!");
         sound(p, "entity.player.levelup");
+        saveAll();
+    }
+
+    // =====================================================================
+    //  BLACK MARKET (rotating stock, paid in gems and coins)
+    // =====================================================================
+    static List<BM> bmStock() {
+        long hour = System.currentTimeMillis() / 3_600_000L;
+        List<BM> pool = new ArrayList<>(cfg.blackMarket);
+        Collections.shuffle(pool, new Random(hour));
+        return pool.subList(0, Math.min(7, pool.size()));
+    }
+
+    static void openBlackMarket(ServerPlayer p) {
+        Gui g = new Gui("\u00a75Black Market", 3).fill();
+        long mins = 60 - (System.currentTimeMillis() / 60_000L) % 60;
+        int[] slots = {10, 11, 12, 13, 14, 15, 16};
+        List<BM> stock = bmStock();
+        for (int i = 0; i < stock.size(); i++) {
+            BM b = stock.get(i);
+            boolean gems = b.cur.equals("gems");
+            String what = b.type.equals("spawner") ? pretty(b.value) + " Spawner" : b.type.equals("key") ? b.amount + "x " + b.value + " Key" : b.amount + "x " + pretty(b.value);
+            Item it = b.type.equals("spawner") ? Items.SPAWNER : b.type.equals("key") ? Items.TRIPWIRE_HOOK : itemOr(b.value, Items.CHEST);
+            g.set(slots[i], icon(it, "\u00a7f" + what, "\u00a77Price: " + (gems ? "\u00a7d" + b.price + " gems" : "\u00a7e" + b.price + " coins"),
+                "\u00a78Click to buy", "\u00a78New stock in " + mins + " min"), (pl, ct) -> buyBM(pl, b));
+        }
+        g.set(4, icon(Items.GOLD_NUGGET, "\u00a7dGems: \u00a7f" + shortNum(gemsOf(p)), "\u00a7eCoins: \u00a7f" + shortNum(coinsOf(p))), null);
+        g.set(22, backIcon(), (pl, ct) -> openMain(pl));
+        g.open(p);
+    }
+
+    static void buyBM(ServerPlayer p, BM b) {
+        boolean gems = b.cur.equals("gems");
+        if ((gems ? gemsOf(p) : coinsOf(p)) < b.price) { msg(p, "\u00a7cYou need " + b.price + " " + b.cur); return; }
+        if (gems) addGems(p, -b.price); else addCoins(p, -b.price);
+        switch (b.type) {
+            case "spawner": giveReward(p, new Reward("spawner", b.value, 1, 1)); break;
+            case "key": addKey(p, b.value, b.amount); break;
+            default: giveReward(p, new Reward("item", b.value, b.amount, 1));
+        }
+        msg(p, "\u00a7aPurchased from the black market!");
+        sound(p, "entity.player.levelup");
+        saveAll();
+        openBlackMarket(p);
+    }
+
+    // =====================================================================
+    //  MAILBOX + GIFTS
+    // =====================================================================
+    static void openMailbox(ServerPlayer p) {
+        List<Mail> list = data.mail.computeIfAbsent(p.getStringUUID(), k -> new ArrayList<>());
+        Gui g = new Gui("\u00a78Mailbox  (" + list.size() + ")", 6).fill();
+        for (int i = 0; i < 45 && i < list.size(); i++) {
+            Mail m = list.get(i);
+            ItemStack show;
+            if (m.kind.equals("stack")) {
+                show = deser(m.payload).copy();
+                if (show.isEmpty()) show = icon(Items.CHEST, "\u00a7f" + m.label);
+                List<Component> lore = new ArrayList<>();
+                lore.add(Component.literal("\u00a7r\u00a77" + m.label));
+                lore.add(Component.literal("\u00a7r\u00a7aClick to claim"));
+                show.set(DataComponents.LORE, new ItemLore(lore));
+            } else show = icon(Items.CHEST, "\u00a7f" + m.label, "\u00a7aClick to claim");
+            g.set(i, show, (pl, ct) -> { if (claimMail(pl, m)) { saveAll(); openMailbox(pl); } });
+        }
+        g.set(48, backIcon(), (pl, ct) -> openMain(pl));
+        g.set(49, icon(Items.HOPPER, "\u00a7aClaim all", "\u00a77Takes everything that fits"), (pl, ct) -> {
+            List<Mail> l = data.mail.getOrDefault(pl.getStringUUID(), new ArrayList<>());
+            for (Mail m : new ArrayList<>(l)) if (!claimMail(pl, m)) break;
+            saveAll();
+            openMailbox(pl);
+        });
+        g.open(p);
+    }
+
+    static void giftHand(ServerPlayer p, String targetName) {
+        String to = uuidByName(targetName);
+        if (to == null) { msg(p, "\u00a7cI don't know a player called " + targetName); return; }
+        if (to.equals(p.getStringUUID())) { msg(p, "\u00a7cYou can't gift yourself."); return; }
+        ItemStack hand = p.getMainHandItem();
+        if (hand.isEmpty()) { msg(p, "\u00a7cHold the item you want to gift."); return; }
+        String json = ser(hand);
+        if (json == null) { msg(p, "\u00a7cThis item can't be gifted."); return; }
+        String label = "Gift from " + p.getName().getString() + ": " + hand.getCount() + "x " + hand.getHoverName().getString();
+        addMail(to, "stack", json, label);
+        p.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+        msg(p, "\u00a7aGift sent to " + data.names.get(to) + "!");
+        ServerPlayer t = server.getPlayerList().getPlayer(UUID.fromString(to));
+        if (t != null) msg(t, "\u00a7e" + label + "  \u00a77- open /mailbox");
         saveAll();
     }
 
@@ -773,8 +960,8 @@ public class Oneblox implements ModInitializer {
             String cr = crate;
             g.set(s++, icon(Items.TRIPWIRE_HOOK, "\u00a7d+5 " + crate + " keys", "\u00a77for you"), (pl, ct) -> { addKey(pl, cr, 5); msg(pl, "\u00a7d+5 " + cr + " keys"); });
         }
-        g.set(19, icon(Items.DIAMOND_BLOCK, "\u00a7bCreative mode"), (pl, ct) -> run("gamemode creative " + pl.getStringUUID()));
-        g.set(20, icon(Items.IRON_SWORD, "\u00a7fSurvival mode"), (pl, ct) -> run("gamemode survival " + pl.getStringUUID()));
+        g.set(19, icon(Items.DIAMOND_BLOCK, "\u00a7bCreative mode"), (pl, ct) -> run("gamemode creative " + pl.getName().getString()));
+        g.set(20, icon(Items.IRON_SWORD, "\u00a7fSurvival mode"), (pl, ct) -> run("gamemode survival " + pl.getName().getString()));
         g.set(21, icon(Items.CLOCK, "\u00a7eSet day"), (pl, ct) -> run("time set day"));
         g.set(22, icon(Items.WATER_BUCKET, "\u00a79Clear weather"), (pl, ct) -> run("weather clear"));
         g.set(23, icon(Items.GOLDEN_APPLE, "\u00a7cHeal and feed"), (pl, ct) -> {
@@ -784,6 +971,9 @@ public class Oneblox implements ModInitializer {
         g.set(25, icon(Items.REDSTONE, "\u00a7cReload config", "\u00a77re-reads config.json"), (pl, ct) -> {
             cfg = load("config.json", Cfg.class, cfg); msg(pl, "\u00a7aConfig reloaded."); });
         g.set(26, icon(Items.WRITABLE_BOOK, "\u00a7aSave data now"), (pl, ct) -> { saveAll(); msg(pl, "\u00a7aSaved."); });
+        g.set(27, icon(Items.NETHER_STAR, "\u00a7d+100 gems", "\u00a77for you"), (pl, ct) -> { addGems(pl, 100); msg(pl, "\u00a7d+100 gems"); });
+        g.set(28, icon(Items.GOLD_NUGGET, "\u00a7e+1,000 coins", "\u00a77for you"), (pl, ct) -> { addCoins(pl, 1000); msg(pl, "\u00a7e+1,000 coins"); });
+        g.set(29, icon(Items.TNT, "\u00a7cReset config to defaults", "\u00a77new prices, crates, black market"), (pl, ct) -> { cfg = new Cfg(); cfg.ownerUuid = pl.getStringUUID(); save("config.json", cfg); msg(pl, "\u00a7aConfig reset."); });
         g.set(31, backIcon(), (pl, ct) -> openMain(pl));
         g.open(p);
     }
@@ -979,16 +1169,18 @@ public class Oneblox implements ModInitializer {
     }
 
     // ---- kit, spawners, hub ----
-    /** Starter kit: wooden tools, "Common Armor" (gray name) worn, 16 steaks. */
+    /** Starter kit: wooden tools, "Common Armor" (gray name) worn, 16 steaks, and the menu item. */
     static void giveKit(ServerPlayer p) {
-        String u = p.getStringUUID();
-        for (String t : new String[]{"sword", "pickaxe", "axe", "shovel", "hoe"}) run("give " + u + " minecraft:wooden_" + t + " 1");
-        String name = "[custom_name={text:\"Common Armor\",color:\"gray\",italic:false}]";
-        run("item replace entity " + u + " armor.head with minecraft:leather_helmet" + name);
-        run("item replace entity " + u + " armor.chest with minecraft:leather_chestplate" + name);
-        run("item replace entity " + u + " armor.legs with minecraft:leather_leggings" + name);
-        run("item replace entity " + u + " armor.feet with minecraft:leather_boots" + name);
-        run("give " + u + " minecraft:cooked_beef 16");
+        for (String t : new String[]{"sword", "pickaxe", "axe", "shovel", "hoe"})
+            deliverGive(p, "give %P% minecraft:wooden_" + t + " 1", "Wooden " + t);
+        deliverGive(p, "give %P% minecraft:cooked_beef 16", "16x Steak");
+        String[] pieces = {"LEATHER_HELMET", "LEATHER_CHESTPLATE", "LEATHER_LEGGINGS", "LEATHER_BOOTS"};
+        EquipmentSlot[] slots = {EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET};
+        for (int i = 0; i < 4; i++) {
+            ItemStack a = icon(item(Items.LEATHER_CHESTPLATE, pieces[i]), "\u00a77Common Armor");
+            try { p.setItemSlot(slots[i], a); } catch (Throwable e) { deliverStack(p, a, "Common Armor"); }
+        }
+        ensureMenuItem(p);
         msg(p, "\u00a7aYou received the starter kit!");
     }
 
@@ -998,7 +1190,7 @@ public class Oneblox implements ModInitializer {
         for (String[] list : PHASE_MOBS) mobs.addAll(Arrays.asList(list));
         for (String m : mobs) {
             runIn("execute if data block " + pos.getX() + " " + pos.getY() + " " + pos.getZ()
-                + " SpawnData.entity{id:\"minecraft:" + m + "\"} run give " + p.getStringUUID()
+                + " SpawnData.entity{id:\"minecraft:" + m + "\"} run give " + p.getName().getString()
                 + " minecraft:spawner[block_entity_data={id:\"minecraft:mob_spawner\",SpawnData:{entity:{id:\"minecraft:" + m + "\"}}}] 1");
         }
     }
@@ -1078,8 +1270,11 @@ public class Oneblox implements ModInitializer {
             pay(sp, blockPay(id, one));
             if (!one) return;
             is.broken++;
-            if (is.broken % cfg.blocksPerPhase == 0 && is.broken / cfg.blocksPerPhase < PHASE_NAME.length)
-                tellIsland(is, "\u00a76New phase reached: " + PHASE_NAME[phase(is)] + "!");
+            if (is.broken % cfg.blocksPerPhase == 0 && is.broken / cfg.blocksPerPhase < PHASE_NAME.length) {
+                tellIsland(is, "\u00a76New phase reached: " + PHASE_NAME[phase(is)] + "!  \u00a7d+10 gems");
+                for (String mm : is.members) { ServerPlayer mp = server.getPlayerList().getPlayer(UUID.fromString(mm)); if (mp != null) addGems(mp, 10); }
+            }
+            if (is.broken % 500 == 0) { addCoins(sp, 10); msg(sp, "\u00a7e+10 coins"); }
             if (is.broken % 100 == 0 && RNG.nextInt(100) < 30) { addKey(sp, "Panda", 1); msg(sp, "\u00a7dYou found a Panda key!"); }
             Isl fis = is;
             placeNext(is);                    // instantly, in the same tick
@@ -1094,6 +1289,14 @@ public class Oneblox implements ModInitializer {
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) -> {
             if (!(source.getEntity() instanceof ServerPlayer sp) || !(entity instanceof Mob)) return;
             pay(sp, Math.max(1L, Math.round(entity.getMaxHealth() * cfg.mobPayPerHealth)));
+        });
+
+        UseItemCallback.EVENT.register((player, world, hand) -> {
+            if (player instanceof ServerPlayer sp && isMenuItem(player.getItemInHand(hand))) {
+                openMain(sp);
+                return InteractionResult.SUCCESS;
+            }
+            return InteractionResult.PASS;
         });
 
         CommandRegistrationCallback.EVENT.register((d, access, env) -> registerCommands(d));
@@ -1134,6 +1337,8 @@ public class Oneblox implements ModInitializer {
                 runIn("setblock " + cx(is.idx) + " " + (Y() - 1) + " " + cz(is.idx) + " minecraft:obsidian keep");
             }
             if (is.ready && data.kit.add(id)) giveKit(p);
+            if (is.ready) ensureMenuItem(p);
+            if (ticks % 1200 == 0) { int mc = data.mail.getOrDefault(id, List.of()).size(); if (mc > 0) msg(p, "\u00a7eYou have " + mc + " item(s) in /mailbox"); }
 
             int fish = p.getStats().getValue(Stats.CUSTOM.get(Stats.FISH_CAUGHT));
             Integer last = LAST_FISH.put(id, fish);
@@ -1193,23 +1398,38 @@ public class Oneblox implements ModInitializer {
         return s;
     }
 
+    /** Score holder names may not contain normal spaces (the command parser stops at them), so use non-breaking spaces. */
+    static String nb(String x) { return x.replace(' ', '\u00a0'); }
+
     static void sidebar(ServerPlayer p, Isl is) {
         int s = slotFor(p);
         String id = p.getStringUUID();
         int ph = phase(is);
+        boolean last = ph >= PHASE_NAME.length - 1;
         int into = is.broken - ph * cfg.blocksPerPhase;
+        int pct = last ? 100 : Math.min(100, into * 100 / cfg.blocksPerPhase);
+        int filled = pct / 10;
+        StringBuilder bar = new StringBuilder("\u00a7a");
+        for (int i = 0; i < 10; i++) { if (i == filled) bar.append("\u00a78"); bar.append('\u2588'); }
+        int level = Math.min(100, is.broken / 25);
+        String owner = data.names.getOrDefault(is.owner, "?").toUpperCase();
         List<String> now = new ArrayList<>();
-        now.add("\u00a76Money: \u00a7f" + fmt(bal(p)));
-        now.add("\u00a7bPhase " + (ph + 1) + ": \u00a7f" + PHASE_NAME[ph]);
-        now.add("\u00a7aBlocks: \u00a7f" + (ph >= PHASE_NAME.length - 1 ? String.valueOf(is.broken) : into + "/" + cfg.blocksPerPhase));
-        now.add("\u00a7eRank: \u00a7f" + pretty(rankId(p)));
-        now.add("\u00a7dMembers: \u00a7f" + is.members.size());
-        now.add("\u00a77oneblox");
+        now.add(nb("\u00a76MONEY: \u00a7f" + shortNum(bal(p))));
+        now.add(nb("\u00a7eCOINS: \u00a7f" + shortNum(coinsOf(p))));
+        now.add(nb("\u00a7dGEMS: \u00a7f" + shortNum(gemsOf(p))));
+        now.add(nb("\u00a7bFLIGHT: \u00a7f" + (cfg.flyRanks.contains(rankId(p)) ? "\u221e" : "None")));
+        now.add("\u00a71");
+        now.add(nb("\u00a7a\u00a7l" + owner + "'S ISLAND"));
+        now.add(nb("\u00a7bPHASE: \u00a7f" + PHASE_NAME[ph].toUpperCase() + " (" + pct + "%)"));
+        now.add(bar.toString());
+        now.add(nb("\u00a76LEVEL: \u00a7f" + level + "/100"));
+        now.add("\u00a72");
+        now.add(nb("\u00a77oneblox"));
         List<String> old = LINES.getOrDefault(id, List.of());
         if (now.equals(old)) return;
         for (int i = 0; i < now.size(); i++)
-            run("scoreboard players set \"" + now.get(i) + "\" ob_" + s + " " + (now.size() - i));
-        for (String o : old) if (!now.contains(o)) run("scoreboard players reset \"" + o + "\" ob_" + s);
+            run("scoreboard players set " + now.get(i) + " ob_" + s + " " + (now.size() - i));
+        for (String o : old) if (!now.contains(o)) run("scoreboard players reset " + o + " ob_" + s);
         LINES.put(id, now);
     }
 
@@ -1224,7 +1444,7 @@ public class Oneblox implements ModInitializer {
 
         Command<CommandSourceStack> balCmd = c -> {
             ServerPlayer p = c.getSource().getPlayerOrException();
-            msg(p, "\u00a76Balance: \u00a7f" + fmt(bal(p)));
+            msg(p, "\u00a76" + fmt(bal(p)) + "  \u00a7e" + shortNum(coinsOf(p)) + " coins  \u00a7d" + shortNum(gemsOf(p)) + " gems");
             return 1;
         };
         d.register(Commands.literal("bal").executes(balCmd));
@@ -1305,6 +1525,20 @@ public class Oneblox implements ModInitializer {
             })));
         LiteralCommandNode<CommandSourceStack> node = d.register(is);
         d.register(Commands.literal("island").redirect(node));
+
+        // ----- currencies, black market, mail -----
+        d.register(Commands.literal("coins").executes(c -> { ServerPlayer p = c.getSource().getPlayerOrException(); msg(p, "\u00a7eCoins: \u00a7f" + shortNum(coinsOf(p))); return 1; }));
+        d.register(Commands.literal("gems").executes(c -> { ServerPlayer p = c.getSource().getPlayerOrException(); msg(p, "\u00a7dGems: \u00a7f" + shortNum(gemsOf(p))); return 1; }));
+        Command<CommandSourceStack> bmCmd = c -> { openBlackMarket(c.getSource().getPlayerOrException()); return 1; };
+        d.register(Commands.literal("blackmarket").executes(bmCmd));
+        d.register(Commands.literal("bm").executes(bmCmd));
+        Command<CommandSourceStack> mailCmd = c -> { openMailbox(c.getSource().getPlayerOrException()); return 1; };
+        d.register(Commands.literal("mailbox").executes(mailCmd));
+        d.register(Commands.literal("mail").executes(mailCmd));
+        d.register(Commands.literal("gift").then(Commands.argument("player", StringArgumentType.word()).executes(c -> {
+            giftHand(c.getSource().getPlayerOrException(), StringArgumentType.getString(c, "player"));
+            return 1;
+        })));
 
         // ----- admin (owner only) -----
         d.register(Commands.literal("admin").executes(c -> { openAdmin(c.getSource().getPlayerOrException()); return 1; }));
