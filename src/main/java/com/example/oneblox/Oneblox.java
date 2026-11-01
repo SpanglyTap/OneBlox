@@ -17,6 +17,8 @@ import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+import net.fabricmc.fabric.api.event.player.UseEntityCallback;
 import net.fabricmc.fabric.api.event.player.UseItemCallback;
 import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
 import net.fabricmc.loader.api.FabricLoader;
@@ -37,7 +39,9 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.SimpleMenuProvider;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
@@ -142,6 +146,7 @@ public class Oneblox implements ModInitializer {
         int nextIsland = 0, nextAuction = 1;
         boolean hubSet = false; double hubX = 0.5, hubY = 64, hubZ = 0.5;
         Set<String> kit = new HashSet<>();
+        Map<String, String> crateAt = new LinkedHashMap<>();   // crate name -> "x,y,z" of its shulker box at spawn
         Map<String, Long> money = new HashMap<>();
         Map<String, Long> coins = new HashMap<>();
         Map<String, Long> gems = new HashMap<>();
@@ -242,6 +247,7 @@ public class Oneblox implements ModInitializer {
         if (a <= 0) return;
         add(p, a);
         msg(p, "\u00a7a+" + fmt(a));
+        soundAt(p, "entity.experience_orb.pickup", 0.25, 1.3);
     }
 
     /** Only the configured owner (default SpanglyTap) is an admin. */
@@ -303,7 +309,19 @@ public class Oneblox implements ModInitializer {
         }
         return fallback;
     }
-    static void sound(ServerPlayer p, String s) { run("playsound minecraft:" + s + " master " + p.getName().getString()); }
+    static void soundAt(ServerPlayer p, String s, double vol, double pitch) {
+        run("execute as " + p.getName().getString() + " at @s run playsound minecraft:" + s + " master @s ~ ~ ~ " + vol + " " + pitch);
+    }
+    static void sound(ServerPlayer p, String s) { soundAt(p, s, 1.0, 1.0); }
+
+    static void celebrate(ServerPlayer p, String title, String sub) {
+        String n = p.getName().getString();
+        run("title " + n + " times 5 50 15");
+        run("title " + n + " subtitle \"" + sub + "\"");
+        run("title " + n + " title \"" + title + "\"");
+        soundAt(p, "entity.player.levelup", 1.0, 1.0);
+        run("execute as " + n + " at @s run particle minecraft:firework ~ ~1 ~ 0.6 0.6 0.6 0.1 40");
+    }
 
     // ---- delivery: items go to the inventory, or to /mailbox when it is full (never dropped) ----
     static void addMail(String uuid, String kind, String payload, String label) {
@@ -336,10 +354,25 @@ public class Oneblox implements ModInitializer {
     static String spawnerGive(String mob) {
         return "give %P% minecraft:spawner[block_entity_data={id:\"minecraft:mob_spawner\",SpawnData:{entity:{id:\"minecraft:" + mob + "\"}}}] 1";
     }
-    /** Looks an item up by id ("diamond_block") through the Items class; null if this version has no such item. */
+    /** Looks an item up by id ("diamond_block"): first through the registry, then through the Items class. null if unknown. */
     static Item itemById(String id) {
-        try { Object o = Items.class.getField(id.toUpperCase(Locale.ROOT)).get(null); return o instanceof Item it ? it : null; }
+        try {
+            Class<?> idC = Class.forName("net.minecraft.resources.Identifier");
+            Object key = idC.getMethod("parse", String.class).invoke(null, "minecraft:" + id);
+            Object reg = BuiltInRegistries.ITEM;
+            Object o = reg.getClass().getMethod("getValue", idC).invoke(reg, key);
+            if (o instanceof Item it && it != Items.AIR) return it;
+        } catch (Throwable ignored) { }
+        try { Object o = Items.class.getField(id.toUpperCase(Locale.ROOT)).get(null); return o instanceof Item it && it != Items.AIR ? it : null; }
         catch (Throwable e) { return null; }
+    }
+
+    /** Sets a data component by field name through reflection, so a missing/renamed component can never break the build. */
+    static void comp(ItemStack s, String field, Object val) {
+        try {
+            Object type = DataComponents.class.getField(field).get(null);
+            ItemStack.class.getMethod("set", Class.forName("net.minecraft.core.component.DataComponentType"), Object.class).invoke(s, type, val);
+        } catch (Throwable ignored) { }
     }
     static Item itemOr(String id, Item fallback) { Item it = itemById(id); return it == null ? fallback : it; }
 
@@ -419,6 +452,8 @@ public class Oneblox implements ModInitializer {
         @Override
         public void clicked(int slot, int button, ContainerInput ct, Player player) {
             if (slot >= 0 && slot < g.rows * 9 && g.acts[slot] != null && player instanceof ServerPlayer sp) {
+                LAST_BUTTON = button;
+                soundAt(sp, "ui.button.click", 0.4, 1.2);
                 try { g.acts[slot].run(sp, ct); } catch (Exception e) { e.printStackTrace(); }
             }
             if (player instanceof ServerPlayer sp2 && sp2.containerMenu == this) this.sendAllDataToRemote();
@@ -467,47 +502,194 @@ public class Oneblox implements ModInitializer {
     // =====================================================================
     //  SHOP + SELL
     // =====================================================================
-    /** category, icon item id, "item:price,item:price,..." */
-    static String[][] SHOP_CATS = {
-        {"Blocks", "grass_block", "oak_log:6,oak_planks:2,cobblestone:3,dirt:2,sand:3,gravel:3,glass:6,stone_bricks:6,bricks:15,sandstone:6,white_wool:10,torch:3,oak_door:8,ladder:5"},
-        {"Farming", "wheat", "wheat_seeds:5,carrot:8,potato:8,melon_seeds:10,pumpkin_seeds:10,sugar_cane:12,oak_sapling:15,bone_meal:20,hay_block:40,bucket:100,water_bucket:150"},
-        {"Food", "cooked_beef", "bread:6,cooked_beef:12,cooked_porkchop:12,cooked_chicken:10,baked_potato:8,golden_carrot:60,golden_apple:600,cake:100"},
-        {"Tools", "iron_pickaxe", "iron_pickaxe:250,iron_axe:250,iron_shovel:120,iron_sword:300,diamond_pickaxe:2500,diamond_axe:2500,diamond_sword:3000,fishing_rod:80,shears:120,lava_bucket:300"},
-        {"Redstone", "redstone", "redstone:10,repeater:40,comparator:60,piston:80,sticky_piston:120,observer:80,hopper:100,dispenser:90,lever:8,redstone_torch:12"},
-        {"Misc", "ender_pearl", "ender_pearl:300,experience_bottle:150,name_tag:200,saddle:500,lead:40,chest:30,furnace:20,crafting_table:10,anvil:400,enchanting_table:1500"}
-    };
+    // =====================================================================
+    //  SHOP: categories with pages, every survival block and item
+    //  Left click buys 1, right click buys 16, shift-click buys 64.
+    // =====================================================================
+    static final String[] COLORS16 = {"white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray",
+            "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black"};
+    static final String[] WOODS = {"oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "pale_oak"};
+    static int LAST_BUTTON = 0;
+
+    static class Cat {
+        String name, icon; List<String[]> items = new ArrayList<>(); List<String[]> vis;
+        Cat(String name, String icon) { this.name = name; this.icon = icon; }
+    }
+    static List<Cat> SHOP;
+
+    static void cat(List<Cat> out, String name, String icon, String list) {
+        Cat c = new Cat(name, icon);
+        for (String e : list.split(",")) {
+            e = e.trim();
+            if (e.isEmpty()) continue;
+            String[] kv = e.split(":");
+            c.items.add(new String[]{kv[0], kv[1]});
+        }
+        out.add(c);
+    }
+
+    /** "white_wool:10,orange_wool:10,..." for one colored block type */
+    static String colored(String suffix, long price) {
+        StringBuilder sb = new StringBuilder();
+        for (String c : COLORS16) sb.append(c).append('_').append(suffix).append(':').append(price).append(',');
+        return sb.toString();
+    }
+
+    static List<Cat> buildShop() {
+        List<Cat> out = new ArrayList<>();
+
+        cat(out, "Building Blocks", "stone_bricks",
+            "stone:5,cobblestone:3,smooth_stone:8,stone_bricks:8,mossy_stone_bricks:10,cracked_stone_bricks:8,chiseled_stone_bricks:10,mossy_cobblestone:8,"
+            + "andesite:6,polished_andesite:8,diorite:6,polished_diorite:8,granite:6,polished_granite:8,calcite:20,tuff:6,polished_tuff:8,tuff_bricks:10,"
+            + "dripstone_block:15,deepslate:8,cobbled_deepslate:6,polished_deepslate:10,deepslate_bricks:12,deepslate_tiles:12,chiseled_deepslate:14,"
+            + "bricks:20,mud_bricks:12,packed_mud:8,mud:4,sandstone:10,smooth_sandstone:12,cut_sandstone:12,chiseled_sandstone:14,red_sandstone:12,"
+            + "smooth_red_sandstone:14,cut_red_sandstone:14,chiseled_red_sandstone:16,prismarine:20,prismarine_bricks:30,dark_prismarine:35,sea_lantern:100,"
+            + "quartz_block:60,chiseled_quartz_block:65,quartz_pillar:65,smooth_quartz:65,quartz_bricks:70,purpur_block:30,purpur_pillar:32,"
+            + "end_stone:10,end_stone_bricks:15,nether_bricks:15,red_nether_bricks:20,chiseled_nether_bricks:18,cracked_nether_bricks:16,"
+            + "blackstone:10,polished_blackstone:14,polished_blackstone_bricks:16,chiseled_polished_blackstone:18,gilded_blackstone:60,"
+            + "basalt:8,polished_basalt:10,smooth_basalt:10,obsidian:60,crying_obsidian:120,glowstone:60,shroomlight:40,terracotta:12,bone_block:20,"
+            + "glass:6,tinted_glass:40,ice:20,packed_ice:40,blue_ice:80,snow_block:8,clay:10,honeycomb_block:50,copper_block:80,cut_copper:85,"
+            + "chiseled_copper:90,exposed_copper:80,weathered_copper:80,oxidized_copper:80,copper_grate:90,copper_bulb:100,netherrack:3,magma_block:25,"
+            + "soul_sand:6,soul_soil:6,sculk:25");
+
+        StringBuilder wood = new StringBuilder();
+        for (String w : WOODS)
+            wood.append(w).append("_log:8,stripped_").append(w).append("_log:9,").append(w).append("_wood:9,stripped_").append(w)
+                .append("_wood:10,").append(w).append("_planks:3,");
+        wood.append("bamboo_block:10,stripped_bamboo_block:11,bamboo_planks:3,bamboo_mosaic:5,crimson_stem:12,stripped_crimson_stem:13,crimson_hyphae:13,"
+            + "crimson_planks:4,warped_stem:12,stripped_warped_stem:13,warped_hyphae:13,warped_planks:4,nether_wart_block:12,warped_wart_block:12");
+        cat(out, "Wood", "oak_log", wood.toString());
+
+        cat(out, "Wool & Terracotta", "white_wool", colored("wool", 10) + colored("terracotta", 12) + colored("glazed_terracotta", 25));
+        cat(out, "Concrete & Glass", "white_concrete", colored("concrete", 12) + colored("concrete_powder", 12) + colored("stained_glass", 8) + colored("dye", 8));
+
+        cat(out, "Ores & Minerals", "diamond_ore",
+            "coal_ore:15,deepslate_coal_ore:18,iron_ore:40,deepslate_iron_ore:45,copper_ore:25,deepslate_copper_ore:28,gold_ore:80,deepslate_gold_ore:90,"
+            + "redstone_ore:35,deepslate_redstone_ore:40,lapis_ore:40,deepslate_lapis_ore:45,diamond_ore:250,deepslate_diamond_ore:280,emerald_ore:300,"
+            + "deepslate_emerald_ore:320,nether_quartz_ore:30,nether_gold_ore:35,ancient_debris:1200,raw_iron:20,raw_copper:10,raw_gold:40,coal:10,charcoal:8,"
+            + "iron_ingot:30,copper_ingot:15,gold_ingot:60,iron_nugget:4,gold_nugget:7,diamond:200,emerald:250,lapis_lazuli:15,redstone:10,quartz:12,"
+            + "amethyst_shard:20,netherite_scrap:1000,netherite_ingot:4500,coal_block:90,iron_block:270,gold_block:540,redstone_block:90,lapis_block:135,"
+            + "diamond_block:1800,emerald_block:2250,netherite_block:40000,raw_iron_block:180,raw_copper_block:90,raw_gold_block:360,amethyst_block:80");
+
+        StringBuilder nat = new StringBuilder(
+            "dirt:3,grass_block:6,podzol:8,mycelium:20,coarse_dirt:4,rooted_dirt:8,moss_block:12,sand:3,red_sand:4,gravel:3,sponge:150,cobweb:20,vine:6,"
+            + "lily_pad:8,sugar_cane:12,bamboo:6,cactus:8,kelp:5,seagrass:4,sea_pickle:15,tube_coral_block:20,brain_coral_block:20,bubble_coral_block:20,"
+            + "fire_coral_block:20,horn_coral_block:20,dandelion:5,poppy:5,blue_orchid:8,allium:8,azure_bluet:8,red_tulip:8,orange_tulip:8,white_tulip:8,"
+            + "pink_tulip:8,oxeye_daisy:8,cornflower:8,lily_of_the_valley:10,sunflower:10,lilac:10,rose_bush:10,peony:10,torchflower:30,pitcher_plant:30,"
+            + "wither_rose:200,spore_blossom:50,azalea:20,flowering_azalea:25,fern:4,large_fern:6,short_grass:3,tall_grass:5,dead_bush:4,red_mushroom:10,"
+            + "brown_mushroom:10,red_mushroom_block:15,brown_mushroom_block:15,mushroom_stem:15,crimson_fungus:12,warped_fungus:12,crimson_roots:6,"
+            + "warped_roots:6,nether_sprouts:6,weeping_vines:10,twisting_vines:10,glow_lichen:10,hanging_roots:10,big_dripleaf:15,small_dripleaf:12,"
+            + "chorus_flower:60,chorus_plant:30,pointed_dripstone:20,moss_carpet:6,pale_moss_block:15,");
+        for (String w : WOODS) nat.append(w).append("_leaves:3,");
+        nat.append("azalea_leaves:3,flowering_azalea_leaves:4,");
+        for (String w : WOODS) nat.append(w.equals("mangrove") ? "mangrove_propagule" : w + "_sapling").append(":15,");
+        cat(out, "Nature", "oak_sapling", nat.toString());
+
+        cat(out, "Farming", "wheat",
+            "wheat_seeds:5,wheat:10,carrot:8,potato:8,beetroot_seeds:6,beetroot:8,melon_seeds:10,melon_slice:4,melon:30,pumpkin_seeds:10,pumpkin:20,"
+            + "carved_pumpkin:25,sweet_berries:8,glow_berries:10,cocoa_beans:10,nether_wart:20,bone_meal:20,hay_block:90,egg:10,sugar:6,milk_bucket:60,"
+            + "water_bucket:150,bucket:100,lava_bucket:300,honey_bottle:40,honeycomb:25,composter:30,iron_hoe:100,diamond_hoe:700,shears:120");
+
+        cat(out, "Food", "cooked_beef",
+            "apple:12,bread:6,cooked_beef:12,beef:5,cooked_porkchop:12,porkchop:5,cooked_chicken:10,chicken:4,cooked_mutton:10,mutton:4,cooked_rabbit:10,"
+            + "rabbit:4,cooked_cod:8,cod:3,cooked_salmon:9,salmon:4,tropical_fish:6,pufferfish:8,baked_potato:8,poisonous_potato:3,golden_carrot:60,"
+            + "golden_apple:600,enchanted_golden_apple:6000,cake:100,pumpkin_pie:25,cookie:4,dried_kelp:3,mushroom_stew:15,rabbit_stew:30,beetroot_soup:18,"
+            + "chorus_fruit:30");
+
+        cat(out, "Mob Drops", "ender_pearl",
+            "leather:20,feather:8,string:10,slime_ball:30,spider_eye:12,gunpowder:25,blaze_rod:80,blaze_powder:40,ender_pearl:300,ender_eye:420,bone:10,"
+            + "rotten_flesh:3,ink_sac:15,glow_ink_sac:30,nautilus_shell:400,scute:100,rabbit_hide:15,rabbit_foot:100,phantom_membrane:80,ghast_tear:200,"
+            + "magma_cream:45,prismarine_shard:25,prismarine_crystals:40,shulker_shell:600,fermented_spider_eye:20,glistering_melon_slice:30,"
+            + "breeze_rod:120,experience_bottle:150,name_tag:200,saddle:500,lead:40");
+
+        cat(out, "Redstone", "redstone",
+            "redstone:10,redstone_torch:12,redstone_block:90,repeater:40,comparator:60,piston:80,sticky_piston:120,observer:80,hopper:100,dropper:70,"
+            + "dispenser:90,lever:8,stone_button:6,oak_button:5,polished_blackstone_button:8,stone_pressure_plate:10,oak_pressure_plate:8,"
+            + "light_weighted_pressure_plate:60,heavy_weighted_pressure_plate:35,polished_blackstone_pressure_plate:14,tripwire_hook:20,target:50,"
+            + "daylight_detector:70,note_block:40,jukebox:200,tnt:80,redstone_lamp:60,lightning_rod:60,sculk_sensor:120,calibrated_sculk_sensor:200,"
+            + "slime_block:150,honey_block:120,rail:10,powered_rail:40,detector_rail:30,activator_rail:30,minecart:60,chest_minecart:90,hopper_minecart:160,"
+            + "furnace_minecart:80,tnt_minecart:130,iron_door:80,iron_trapdoor:70,oak_door:8,oak_trapdoor:8,oak_fence_gate:8,bell:300,lectern:80,crafter:200,"
+            + "trapped_chest:50");
+
+        cat(out, "Utility", "crafting_table",
+            "chest:30,barrel:25,ender_chest:600,shulker_box:300,furnace:20,blast_furnace:120,smoker:80,crafting_table:10,smithing_table:60,"
+            + "fletching_table:40,cartography_table:40,loom:50,stonecutter:60,grindstone:50,anvil:400,enchanting_table:1500,brewing_stand:300,cauldron:200,"
+            + "bookshelf:90,chiseled_bookshelf:100,ladder:5,scaffolding:20,torch:3,soul_torch:4,lantern:40,soul_lantern:45,campfire:50,soul_campfire:55,"
+            + "candle:15,painting:20,item_frame:15,glow_item_frame:35,armor_stand:40,flower_pot:10,compass:50,clock:50,spyglass:100,fishing_rod:80,"
+            + "flint_and_steel:40,oak_boat:20,book:20,writable_book:60,paper:3,white_bed:50,red_bed:50,blue_bed:50,black_bed:50,safari_net:25000,"
+            + "end_crystal:2500,respawn_anchor:800,lodestone:900,beacon:12000,conduit:6000");
+
+        cat(out, "Tools & Combat", "diamond_sword",
+            "wooden_sword:20,wooden_pickaxe:20,wooden_axe:20,wooden_shovel:10,wooden_hoe:10,stone_sword:50,stone_pickaxe:50,stone_axe:50,stone_shovel:25,"
+            + "stone_hoe:25,iron_sword:300,iron_pickaxe:250,iron_axe:250,iron_shovel:120,iron_hoe:100,golden_sword:200,golden_pickaxe:200,golden_axe:200,"
+            + "golden_shovel:100,golden_hoe:100,diamond_sword:3000,diamond_pickaxe:2500,diamond_axe:2500,diamond_shovel:1200,diamond_hoe:700,"
+            + "netherite_sword:12000,netherite_pickaxe:11000,netherite_axe:11000,netherite_shovel:9000,netherite_hoe:8000,bow:100,crossbow:150,arrow:5,"
+            + "spectral_arrow:15,shield:100,trident:5000,leather_helmet:60,leather_chestplate:100,leather_leggings:80,leather_boots:50,chainmail_helmet:200,"
+            + "chainmail_chestplate:320,chainmail_leggings:280,chainmail_boots:160,iron_helmet:500,iron_chestplate:800,iron_leggings:700,iron_boots:400,"
+            + "golden_helmet:400,golden_chestplate:640,golden_leggings:560,golden_boots:320,diamond_helmet:4000,diamond_chestplate:6400,"
+            + "diamond_leggings:5600,diamond_boots:3200,netherite_helmet:16000,netherite_chestplate:24000,netherite_leggings:20000,netherite_boots:14000");
+        return out;
+    }
+
+    /** Items this game version really has (unknown ids are hidden instead of failing at purchase time). */
+    static List<String[]> visible(Cat c) {
+        if (c.vis != null) return c.vis;
+        boolean lookupWorks = itemById("stone") != null;
+        List<String[]> v = new ArrayList<>();
+        for (String[] e : c.items) if (!lookupWorks || e[0].equals("safari_net") || itemById(e[0]) != null) v.add(e);
+        c.vis = v;
+        return v;
+    }
 
     static void openShop(ServerPlayer p) {
-        Gui g = new Gui("\u00a78Shop  -  " + fmt(bal(p)), 3).fill();
-        int[] slots = {10, 11, 12, 14, 15, 16};
-        for (int i = 0; i < SHOP_CATS.length && i < slots.length; i++) {
+        if (SHOP == null) SHOP = buildShop();
+        Gui g = new Gui("\u00a78Shop  -  " + fmt(bal(p)), 4).fill();
+        int[] slots = {10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24, 25};
+        for (int i = 0; i < SHOP.size() && i < slots.length; i++) {
+            Cat c = SHOP.get(i);
             int ci = i;
-            g.set(slots[i], icon(itemOr(SHOP_CATS[i][1], Items.CHEST), "\u00a7a" + SHOP_CATS[i][0], "\u00a77Click to browse"), (pl, ct) -> openShopCat(pl, ci));
+            g.set(slots[i], icon(itemOr(c.icon, Items.CHEST), "\u00a7a" + c.name, "\u00a77" + visible(c).size() + " items", "\u00a78Click to browse"),
+                (pl, ct) -> openShopCat(pl, ci, 0));
         }
-        g.set(22, backIcon(), (pl, ct) -> openMain(pl));
+        g.set(31, backIcon(), (pl, ct) -> openMain(pl));
         g.open(p);
     }
 
-    static void openShopCat(ServerPlayer p, int ci) {
-        Gui g = new Gui("\u00a78Shop: " + SHOP_CATS[ci][0] + "  -  " + fmt(bal(p)), 6).fill();
-        String[] entries = SHOP_CATS[ci][2].split(",");
-        for (int i = 0; i < entries.length && i < 45; i++) {
-            String[] e = entries[i].split(":");
-            String id = e[0];
-            long price = Long.parseLong(e[1]);
-            g.set(i, icon(itemOr(id, Items.CHEST), "\u00a7f" + pretty(id), "\u00a77Price: \u00a7a" + fmt(price) + " each", "\u00a78Click: buy 1  |  Shift-click: buy 16"),
-                (pl, ct) -> buyItem(pl, id, price, shift(ct) ? 16 : 1));
+    static void openShopCat(ServerPlayer p, int ci, int page) {
+        if (SHOP == null) SHOP = buildShop();
+        Cat c = SHOP.get(ci);
+        List<String[]> list = visible(c);
+        int per = 45;
+        int pages = Math.max(1, (list.size() + per - 1) / per);
+        int pg = Math.max(0, Math.min(page, pages - 1));
+        Gui g = new Gui("\u00a78" + c.name + "  (" + (pg + 1) + "/" + pages + ")  -  " + fmt(bal(p)), 6).fill();
+        for (int i = 0; i < per; i++) {
+            int idx = pg * per + i;
+            if (idx >= list.size()) break;
+            String id = list.get(idx)[0];
+            long price = Long.parseLong(list.get(idx)[1]);
+            ItemStack show = id.equals("safari_net") ? safariNet() : icon(itemOr(id, Items.CHEST), "\u00a7f" + pretty(id));
+            List<Component> lore = new ArrayList<>();
+            lore.add(Component.literal("\u00a7r\u00a77Price: \u00a7a" + fmt(price) + " each"));
+            lore.add(Component.literal("\u00a7r\u00a78Left: x1   Right: x16   Shift: x64"));
+            show.set(DataComponents.LORE, new ItemLore(lore));
+            g.set(i, show, (pl, ct) -> buyItem(pl, id, price, shift(ct) ? 64 : LAST_BUTTON == 1 ? 16 : 1));
         }
-        g.set(49, icon(Items.ARROW, "\u00a7eBack to shop"), (pl, ct) -> openShop(pl));
+        g.set(45, icon(Items.ARROW, "\u00a7ePrevious page"), (pl, ct) -> openShopCat(pl, ci, pg - 1));
+        g.set(49, icon(Items.CHEST, "\u00a7eAll categories"), (pl, ct) -> openShop(pl));
+        g.set(53, icon(Items.ARROW, "\u00a7eNext page"), (pl, ct) -> openShopCat(pl, ci, pg + 1));
         g.open(p);
     }
 
     static void buyItem(ServerPlayer p, String id, long price, int n) {
+        if (id.equals("safari_net")) n = 1;
         long cost = price * n;
         if (bal(p) < cost) { msg(p, "\u00a7cYou need " + fmt(cost)); return; }
         add(p, -cost);
-        deliverGive(p, "give %P% minecraft:" + id + " " + n, n + "x " + pretty(id));
+        if (id.equals("safari_net")) deliverStack(p, safariNet(), "Safari Net");
+        else deliverGive(p, "give %P% minecraft:" + id + " " + n, n + "x " + pretty(id));
         msg(p, "\u00a7aBought " + n + "x " + pretty(id) + " for " + fmt(cost));
+        soundAt(p, "entity.item.pickup", 0.6, 1.0);
     }
 
     static long sellValue(ServerPlayer p, boolean remove) {
@@ -640,11 +822,36 @@ public class Oneblox implements ModInitializer {
     // =====================================================================
     //  CRATES + KEYS + SPAWNERS + DAILY
     // =====================================================================
-    static int keyCount(ServerPlayer p, String crate) {
-        return data.keys.computeIfAbsent(p.getStringUUID(), k -> new HashMap<>()).getOrDefault(crate, 0);
+    // ---- physical keys: a colored candle named "<Crate> Key" ----
+    static ItemStack keyStack(String crate, int n) {
+        String f = crate.equals("Panda") ? "black_candle" : crate.equals("Infinity") ? "light_blue_candle" : crate.equals("Mythic") ? "purple_candle" : "candle";
+        ItemStack s = icon(itemOr(f, itemOr("candle", Items.STICK)), "\u00a7e\u00a7l" + crate + " Key",
+            "\u00a77Right-click a \u00a7f" + crate + " Crate \u00a77at spawn", "\u00a77to open it.");
+        s.setCount(n);
+        comp(s, "ENCHANTMENT_GLINT_OVERRIDE", Boolean.TRUE);
+        return s;
     }
+    static boolean isKey(ItemStack st, String crate) {
+        return !st.isEmpty() && st.getHoverName().getString().contains(crate + " Key")
+            && BuiltInRegistries.ITEM.getKey(st.getItem()).getPath().contains("candle");
+    }
+    static int keyCount(ServerPlayer p, String crate) {
+        Inventory inv = p.getInventory();
+        int n = 0;
+        for (int i = 0; i < inv.getContainerSize(); i++) if (isKey(inv.getItem(i), crate)) n += inv.getItem(i).getCount();
+        return n;
+    }
+    static boolean takeKey(ServerPlayer p, String crate) {
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack st = inv.getItem(i);
+            if (isKey(st, crate)) { st.shrink(1); return true; }
+        }
+        return false;
+    }
+    /** Gives physical keys (to /mailbox if the inventory is full). */
     static void addKey(ServerPlayer p, String crate, int n) {
-        data.keys.computeIfAbsent(p.getStringUUID(), k -> new HashMap<>()).merge(crate, n, Integer::sum);
+        if (n > 0) deliverStack(p, keyStack(crate, n), n + "x " + crate + " Key");
     }
 
     static String rewardName(Reward r) {
@@ -680,6 +887,74 @@ public class Oneblox implements ModInitializer {
         }
     }
 
+    // =====================================================================
+    //  PHYSICAL CRATES (shulker boxes at spawn), candle keys and THE ROLL
+    // =====================================================================
+    static final String[] SHULKERS = {"black_shulker_box", "light_blue_shulker_box", "purple_shulker_box", "red_shulker_box", "lime_shulker_box"};
+    static final Set<String> ROLLING = new HashSet<>();
+
+    static int totalWeight(List<Reward> pool) { int t = 0; for (Reward r : pool) t += Math.max(1, r.weight); return t; }
+    static double chance(Reward r, int total) { return 100.0 * Math.max(1, r.weight) / total; }
+    static String rarityColor(Reward r, int total) { double c = chance(r, total); return c < 3 ? "\u00a76" : c < 8 ? "\u00a75" : c < 16 ? "\u00a79" : "\u00a77"; }
+    static String rarityName(Reward r, int total) { double c = chance(r, total); return c < 3 ? "LEGENDARY" : c < 8 ? "EPIC" : c < 16 ? "RARE" : "COMMON"; }
+    static String plainName(Reward r) { return rewardName(r).replaceAll("\u00a7.", ""); }
+    static ItemStack rewardIcon(Reward r, int total) {
+        Item it = r.type.equals("money") ? Items.EMERALD : r.type.equals("spawner") ? Items.SPAWNER : r.type.equals("key") ? itemOr("tripwire_hook", Items.STICK)
+            : (r.type.equals("coins") || r.type.equals("gems")) ? Items.GOLD_NUGGET : itemOr(r.value, Items.CHEST);
+        String col = rarityColor(r, total);
+        ItemStack s = icon(it, col + plainName(r), col + rarityName(r, total), String.format(Locale.US, "\u00a78%.1f%% chance", chance(r, total)));
+        if (chance(r, total) < 8) comp(s, "ENCHANTMENT_GLINT_OVERRIDE", Boolean.TRUE);
+        return s;
+    }
+
+    static int[] crateXYZ(String crate) {
+        String v = data.crateAt.get(crate);
+        if (v == null) return null;
+        String[] a = v.split(",");
+        return new int[]{Integer.parseInt(a[0]), Integer.parseInt(a[1]), Integer.parseInt(a[2])};
+    }
+
+    /** Places the crate shulker boxes in a row, each with a floating label. x,y,z is the middle crate. */
+    static void buildCrates(int x, int y, int z) {
+        runIn("forceload add " + (x - 12) + " " + (z - 12) + " " + (x + 12) + " " + (z + 12));
+        later(40, () -> {
+            runIn("kill @e[type=minecraft:text_display,tag=oneblox_label]");
+            int i = 0;
+            for (String crate : cfg.crates.keySet()) {
+                if (i >= 3) break;
+                int cx = x + (i - 1) * 4;
+                runIn("setblock " + cx + " " + (y - 1) + " " + z + " minecraft:gold_block");
+                runIn("setblock " + cx + " " + y + " " + z + " minecraft:" + SHULKERS[i]);
+                runIn("summon minecraft:text_display " + (cx + 0.5) + " " + (y + 1.9) + " " + (z + 0.5)
+                    + " {Tags:[\"oneblox_label\"],billboard:\"center\",text:{text:\"" + crate.toUpperCase() + " CRATE\",color:\"gold\",bold:true}}");
+                data.crateAt.put(crate, cx + "," + y + "," + z);
+                i++;
+            }
+            saveAll();
+        });
+        later(120, () -> runIn("forceload remove " + (x - 12) + " " + (z - 12) + " " + (x + 12) + " " + (z + 12)));
+    }
+
+    static boolean crateClick(ServerPlayer p, BlockPos pos) {
+        for (Map.Entry<String, String> e : data.crateAt.entrySet()) {
+            String[] a = e.getValue().split(",");
+            if (pos.getX() == Integer.parseInt(a[0]) && pos.getY() == Integer.parseInt(a[1]) && pos.getZ() == Integer.parseInt(a[2])) {
+                if (keyCount(p, e.getKey()) > 0) openCrate(p, e.getKey());
+                else { openCratePreview(p, e.getKey()); msg(p, "\u00a7cYou need a " + e.getKey() + " Key - buy one in /crates"); }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Sparkles above every crate so spawn feels alive. */
+    static void crateAmbience() {
+        for (String v : data.crateAt.values()) {
+            String[] a = v.split(",");
+            runIn("particle minecraft:end_rod " + (Integer.parseInt(a[0]) + 0.5) + " " + (Integer.parseInt(a[1]) + 1.3) + " " + (Integer.parseInt(a[2]) + 0.5) + " 0.3 0.5 0.3 0.02 3");
+        }
+    }
+
     static void openCrates(ServerPlayer p) {
         Gui g = new Gui("\u00a78Crates", 3).fill();
         Item[] ci = {Items.CHEST, Items.ENDER_CHEST, Items.BARREL};
@@ -688,21 +963,35 @@ public class Oneblox implements ModInitializer {
         for (String crate : cfg.crates.keySet()) {
             if (n >= 3) break;
             long price = cfg.keyPrice.getOrDefault(crate, 10000L);
-            List<String> lore = new ArrayList<>();
-            lore.add("\u00a77Your keys: \u00a7f" + keyCount(p, crate));
-            lore.add("\u00a77Key price: \u00a7a" + fmt(price));
-            lore.add(" ");
-            lore.add("\u00a7eRewards:");
-            for (Reward r : cfg.crates.get(crate)) lore.add(" \u00a78- " + rewardName(r));
-            lore.add(" ");
-            lore.add("\u00a7aClick: open (uses 1 key)");
-            lore.add("\u00a7aShift-click: buy a key");
             String cr = crate;
-            g.set(slots[n], icon(ci[n], "\u00a7d" + crate + " Crate", lore.toArray(new String[0])),
-                (pl, ct) -> { if (shift(ct)) buyKey(pl, cr); else openCrate(pl, cr); });
+            g.set(slots[n], icon(ci[n], "\u00a7d" + crate + " Crate", "\u00a77Your keys: \u00a7f" + keyCount(p, crate), "\u00a77Key price: \u00a7a" + fmt(price), " ",
+                "\u00a7aClick: see the rewards", "\u00a7aShift-click: buy a key", "\u00a78Open it at the crates in the hub"),
+                (pl, ct) -> { if (shift(ct)) buyKey(pl, cr); else openCratePreview(pl, cr); });
             n++;
         }
-        g.set(22, backIcon(), (pl, ct) -> openMain(pl));
+        g.set(22, icon(Items.COMPASS, "\u00a7fGo to the crates", "\u00a77Teleport to the hub crates"), (pl, ct) -> {
+            int[] c = null;
+            for (String name : cfg.crates.keySet()) { c = crateXYZ(name); if (c != null) break; }
+            pl.closeContainer();
+            if (c != null) tp(pl, c[0] + 4.5, c[1] + 1, c[2] - 3.5); else toHub(pl);
+        });
+        g.set(18, backIcon(), (pl, ct) -> openMain(pl));
+        g.open(p);
+    }
+
+    static void openCratePreview(ServerPlayer p, String crate) {
+        List<Reward> pool = cfg.crates.get(crate);
+        if (pool == null) return;
+        int total = totalWeight(pool);
+        Gui g = new Gui("\u00a78" + crate + " Crate - rewards", 4).fill();
+        int[] slots = {10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24, 25};
+        List<Reward> sorted = new ArrayList<>(pool);
+        sorted.sort((x, y) -> Integer.compare(y.weight, x.weight));
+        for (int i = 0; i < sorted.size() && i < slots.length; i++) g.set(slots[i], rewardIcon(sorted.get(i), total), null);
+        long price = cfg.keyPrice.getOrDefault(crate, 10000L);
+        g.set(30, icon(Items.GOLD_INGOT, "\u00a7aBuy a key", "\u00a77" + fmt(price), "\u00a77You have: \u00a7f" + keyCount(p, crate)), (pl, ct) -> { buyKey(pl, crate); openCratePreview(pl, crate); });
+        g.set(32, icon(Items.ENDER_CHEST, "\u00a7eHow to open", "\u00a77Hold a " + crate + " Key and", "\u00a77right-click the crate at spawn"), null);
+        g.set(31, icon(Items.ARROW, "\u00a7eBack"), (pl, ct) -> openCrates(pl));
         g.open(p);
     }
 
@@ -711,35 +1000,80 @@ public class Oneblox implements ModInitializer {
         if (bal(p) < price) { msg(p, "\u00a7cYou need " + fmt(price)); return; }
         add(p, -price);
         addKey(p, crate, 1);
-        msg(p, "\u00a7aBought a " + crate + " key");
-        openCrates(p);
+        msg(p, "\u00a7aBought a " + crate + " Key");
+        soundAt(p, "entity.item.pickup", 0.6, 1.0);
+    }
+
+    // ---------------- the roll ----------------
+    static final String[] RAINBOW = {"red", "orange", "yellow", "lime", "cyan", "light_blue", "purple", "magenta"};
+
+    static void drawRoll(Gui g, List<Reward> strip, int off, int total, int color) {
+        for (int j = 0; j < 9; j++) g.box.setItem(9 + j, rewardIcon(strip.get(off + j), total));
+        Item pane = itemOr(RAINBOW[color % RAINBOW.length] + "_stained_glass_pane", itemOr("glass_pane", Items.GLASS));
+        for (int i = 0; i < 27; i++) if (i < 9 || i >= 18) g.box.setItem(i, icon(pane, " "));
+        g.box.setItem(4, icon(itemOr("hopper", Items.STICK), "\u00a7e\u25bc"));
+        g.box.setItem(22, icon(itemOr("hopper", Items.STICK), "\u00a7e\u25b2"));
     }
 
     static void openCrate(ServerPlayer p, String crate) {
         List<Reward> pool = cfg.crates.get(crate);
         if (pool == null || pool.isEmpty()) return;
-        if (keyCount(p, crate) < 1) { msg(p, "\u00a7cNo " + crate + " keys. Shift-click the crate to buy one."); return; }
-        addKey(p, crate, -1);
+        String id = p.getStringUUID();
+        if (ROLLING.contains(id)) { msg(p, "\u00a7cWait for your roll to finish."); return; }
+        if (!takeKey(p, crate)) { msg(p, "\u00a7cYou need a " + crate + " Key."); return; }
+        ROLLING.add(id);
+        int total = totalWeight(pool);
         Reward win = pickReward(pool);
-        Gui g = new Gui("\u00a78" + crate + " Crate", 3).fill();
+        int N = 40, W = 34;
+        List<Reward> strip = new ArrayList<>();
+        for (int i = 0; i < N; i++) strip.add(i == W ? win : pickReward(pool));
+        Gui g = new Gui("\u00a78" + crate + " Crate", 3);
+        drawRoll(g, strip, 0, total, 0);
         g.open(p);
-        for (int i = 1; i <= 12; i++) {
-            int step = i;
-            later(step * 3, () -> {
+        soundAt(p, "block.chest.open", 1.0, 1.0);
+        int steps = W - 4;
+        int t = 4;
+        for (int off = 1; off <= steps; off++) {
+            t += 1 + off / 6;                 // starts fast, slows down: tick, tick, tick ... tick ... tick
+            int o = off, at = t;
+            later(at, () -> {
                 if (p.containerMenu instanceof GuiMenu gm && gm.g == g) {
-                    Reward r = step == 12 ? win : pool.get(RNG.nextInt(pool.size()));
-                    g.box.setItem(13, rewardIcon(r));
-                    if (step == 12) {
-                        g.set(11, icon(Items.TRIPWIRE_HOOK, "\u00a7aOpen again", "\u00a77Keys left: \u00a7f" + keyCount(p, crate)), (pl, ct) -> openCrate(pl, crate));
-                        g.set(15, icon(Items.ENDER_CHEST, "\u00a7eBack to crates"), (pl, ct) -> openCrates(pl));
-                        g.set(22, icon(Items.BARRIER, "\u00a7cClose"), (pl, ct) -> pl.closeContainer());
-                    }
+                    drawRoll(g, strip, o, total, o);
                     gm.broadcastChanges();
-                    sound(p, step == 12 ? "entity.player.levelup" : "ui.button.click");
                 }
+                soundAt(p, "block.note_block.hat", 0.7, 0.7 + 1.3 * o / steps);
             });
         }
-        later(40, () -> { giveReward(p, win); msg(p, "\u00a76You won: " + rewardName(win)); saveAll(); });
+        int end = t + 12;
+        later(end, () -> {
+            String col = rarityColor(win, total);
+            boolean big = chance(win, total) < 8;
+            if (p.containerMenu instanceof GuiMenu gm && gm.g == g) {
+                Item gold = itemOr(big ? "yellow_stained_glass_pane" : "lime_stained_glass_pane", itemOr("glass_pane", Items.GLASS));
+                for (int i = 0; i < 27; i++) if (i != 13 && i != 4 && i != 22) g.box.setItem(i, icon(gold, " "));
+                g.box.setItem(13, rewardIcon(win, total));
+                g.set(11, icon(itemOr("tripwire_hook", Items.STICK), "\u00a7aOpen again", "\u00a77Keys left: \u00a7f" + keyCount(p, crate)), (pl, ct) -> openCrate(pl, crate));
+                g.set(15, icon(Items.ENDER_CHEST, "\u00a7eBack to crates"), (pl, ct) -> openCrates(pl));
+                g.set(22, icon(Items.BARRIER, "\u00a7cClose"), (pl, ct) -> pl.closeContainer());
+                gm.broadcastChanges();
+            }
+            giveReward(p, win);
+            String n = p.getName().getString();
+            run("title " + n + " times 5 60 20");
+            run("title " + n + " subtitle \"" + col + rarityName(win, total) + " \u00a77- " + crate + " Crate\"");
+            run("title " + n + " title \"" + col + "\u00a7l" + plainName(win) + "\"");
+            soundAt(p, "entity.player.levelup", 1.0, big ? 1.2 : 1.0);
+            if (big) {
+                soundAt(p, "ui.toast.challenge_complete", 1.0, 1.0);
+                soundAt(p, "entity.firework_rocket.blast", 1.0, 1.0);
+                run("execute as " + n + " at @s run particle minecraft:totem_of_undying ~ ~1 ~ 0.7 0.9 0.7 0.5 80");
+                if (chance(win, total) < 3)
+                    server.getPlayerList().broadcastSystemMessage(Component.literal("\u00a76\u2726 " + n + " won \u00a7e\u00a7l" + plainName(win) + "\u00a76 from the " + crate + " Crate! \u2726"), false);
+            } else run("execute as " + n + " at @s run particle minecraft:happy_villager ~ ~1 ~ 0.5 0.6 0.5 0.1 20");
+            msg(p, "\u00a76You won: " + rewardName(win));
+            ROLLING.remove(p.getStringUUID());
+            saveAll();
+        });
     }
 
     static void openSpawners(ServerPlayer p) {
@@ -872,6 +1206,71 @@ public class Oneblox implements ModInitializer {
     }
 
     // =====================================================================
+    //  SAFARI NET: catch one mob (100 uses), release it somewhere else
+    // =====================================================================
+    static ItemStack safariNet() {
+        ItemStack s = icon(Items.LEAD, "\u00a7a\u00a7lSafari Net", "\u00a77Right-click a mob to catch it", "\u00a77Right-click the ground to release it", "\u00a78Uses left: 100");
+        comp(s, "MAX_STACK_SIZE", 1);
+        comp(s, "MAX_DAMAGE", 100);
+        return s;
+    }
+    static boolean isNet(ItemStack st) { return !st.isEmpty() && st.getItem() == Items.LEAD && st.getHoverName().getString().contains("Safari Net"); }
+
+    static String netHolding(ItemStack st) {
+        ItemLore lore = st.get(DataComponents.LORE);
+        if (lore == null) return null;
+        for (Component c : lore.lines()) {
+            String t = c.getString().replaceAll("\u00a7.", "");
+            if (t.startsWith("Holding: ")) return t.substring(9).trim();
+        }
+        return null;
+    }
+
+    static void netSetLore(ItemStack st, String mob) {
+        int left = Math.max(0, st.getMaxDamage() - st.getDamageValue());
+        List<Component> l = new ArrayList<>();
+        l.add(Component.literal("\u00a7r\u00a77" + (mob == null ? "Right-click a mob to catch it" : "Holding: \u00a7f" + mob)));
+        l.add(Component.literal("\u00a7r\u00a77Right-click the ground to release it"));
+        l.add(Component.literal("\u00a7r\u00a78Uses left: " + left));
+        st.set(DataComponents.LORE, new ItemLore(l));
+    }
+
+    static InteractionResult netCatch(ServerPlayer p, InteractionHand hand, Entity e) {
+        ItemStack st = p.getItemInHand(hand);
+        if (!isNet(st)) return InteractionResult.PASS;
+        if (netHolding(st) != null) { msg(p, "\u00a7cYour net already holds a mob. Release it first."); return InteractionResult.SUCCESS; }
+        if (!(e instanceof Mob)) { msg(p, "\u00a7cYou can only catch mobs."); return InteractionResult.SUCCESS; }
+        String id = BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getPath();
+        if (id.equals("ender_dragon") || id.equals("wither")) { msg(p, "\u00a7cThat mob is far too strong for a net."); return InteractionResult.SUCCESS; }
+        boolean baby = e instanceof LivingEntity le && le.isBaby();
+        e.discard();
+        st.setDamageValue(st.getDamageValue() + 1);
+        netSetLore(st, id + (baby ? " (baby)" : ""));
+        msg(p, "\u00a7aCaught a " + pretty(id) + "!");
+        soundAt(p, "entity.item.pickup", 1.0, 0.8);
+        return InteractionResult.SUCCESS;
+    }
+
+    static boolean netRelease(ServerPlayer p, InteractionHand hand) {
+        ItemStack st = p.getItemInHand(hand);
+        if (!isNet(st)) return false;
+        String held = netHolding(st);
+        if (held == null) return false;
+        boolean baby = held.contains("(baby)");
+        String id = held.replace("(baby)", "").trim();
+        run("execute as " + p.getName().getString() + " at @s rotated ~ 0 run summon minecraft:" + id + " ^ ^ ^2" + (baby ? " {Age:-24000,IsBaby:1b}" : ""));
+        netSetLore(st, null);
+        msg(p, "\u00a7aReleased the " + pretty(id) + "!");
+        soundAt(p, "entity.item.pickup", 1.0, 1.4);
+        if (st.getMaxDamage() > 0 && st.getDamageValue() >= st.getMaxDamage()) {
+            p.setItemInHand(hand, ItemStack.EMPTY);
+            msg(p, "\u00a7eYour Safari Net broke!");
+            soundAt(p, "entity.item.break", 1.0, 1.0);
+        }
+        return true;
+    }
+
+    // =====================================================================
     //  LEADERBOARDS
     // =====================================================================
     static void openTop(ServerPlayer p) {
@@ -974,6 +1373,9 @@ public class Oneblox implements ModInitializer {
         g.set(27, icon(Items.NETHER_STAR, "\u00a7d+100 gems", "\u00a77for you"), (pl, ct) -> { addGems(pl, 100); msg(pl, "\u00a7d+100 gems"); });
         g.set(28, icon(Items.GOLD_NUGGET, "\u00a7e+1,000 coins", "\u00a77for you"), (pl, ct) -> { addCoins(pl, 1000); msg(pl, "\u00a7e+1,000 coins"); });
         g.set(29, icon(Items.TNT, "\u00a7cReset config to defaults", "\u00a77new prices, crates, black market"), (pl, ct) -> { cfg = new Cfg(); cfg.ownerUuid = pl.getStringUUID(); save("config.json", cfg); msg(pl, "\u00a7aConfig reset."); });
+        g.set(30, icon(Items.SHULKER_BOX, "\u00a76Build crates here", "\u00a77Places the 3 crate boxes where you stand"),
+            (pl, ct) -> { buildCrates((int) Math.floor(pl.getX()), (int) Math.floor(pl.getY()), (int) Math.floor(pl.getZ()) + 3); msg(pl, "\u00a7aBuilding crates..."); });
+        g.set(32, icon(Items.LEAD, "\u00a7aSafari Net", "\u00a77give yourself one"), (pl, ct) -> deliverStack(pl, safariNet(), "Safari Net"));
         g.set(31, backIcon(), (pl, ct) -> openMain(pl));
         g.open(p);
     }
@@ -1202,6 +1604,7 @@ public class Oneblox implements ModInitializer {
         later(40, () -> runIn("fill -20 " + (y - 1) + " -20 20 " + (y - 1) + " 20 minecraft:stone_bricks"));
         later(120, () -> runIn("forceload remove -25 -25 25 25"));
         data.hubSet = true; data.hubX = 0.5; data.hubY = y; data.hubZ = 0.5;
+        later(60, () -> buildCrates(0, y, 6));
         saveAll();
     }
 
@@ -1229,6 +1632,11 @@ public class Oneblox implements ModInitializer {
             if (data.ver != 4 || !mode.equals(data.mode)) { data = new Data(); data.ver = 4; data.mode = mode; }
             System.out.println("[Oneblox] Mode: " + (voidDim ? "own void dimension" : voidWorld ? "void overworld (Superflat void)" : "FALLBACK - floating islands in the normal overworld (oneblox:void did not load)"));
             buildHub();
+            // hub from an older version has no crates yet: add them next to it
+            later(200, () -> {
+                if (data.hubSet && data.crateAt.isEmpty())
+                    buildCrates((int) Math.floor(data.hubX), (int) Math.floor(data.hubY), (int) Math.floor(data.hubZ) + 6);
+            });
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(s -> saveAll());
 
@@ -1271,8 +1679,10 @@ public class Oneblox implements ModInitializer {
             if (!one) return;
             is.broken++;
             if (is.broken % cfg.blocksPerPhase == 0 && is.broken / cfg.blocksPerPhase < PHASE_NAME.length) {
-                tellIsland(is, "\u00a76New phase reached: " + PHASE_NAME[phase(is)] + "!  \u00a7d+10 gems");
-                for (String mm : is.members) { ServerPlayer mp = server.getPlayerList().getPlayer(UUID.fromString(mm)); if (mp != null) addGems(mp, 10); }
+                for (String mm : is.members) {
+                    ServerPlayer mp = server.getPlayerList().getPlayer(UUID.fromString(mm));
+                    if (mp != null) { addGems(mp, 10); celebrate(mp, "\u00a76\u00a7lPHASE " + (phase(is) + 1), "\u00a7f" + PHASE_NAME[phase(is)] + "  \u00a7d+10 gems"); }
+                }
             }
             if (is.broken % 500 == 0) { addCoins(sp, 10); msg(sp, "\u00a7e+10 coins"); }
             if (is.broken % 100 == 0 && RNG.nextInt(100) < 30) { addKey(sp, "Panda", 1); msg(sp, "\u00a7dYou found a Panda key!"); }
@@ -1292,10 +1702,20 @@ public class Oneblox implements ModInitializer {
         });
 
         UseItemCallback.EVENT.register((player, world, hand) -> {
-            if (player instanceof ServerPlayer sp && isMenuItem(player.getItemInHand(hand))) {
-                openMain(sp);
-                return InteractionResult.SUCCESS;
+            if (player instanceof ServerPlayer sp) {
+                if (isMenuItem(player.getItemInHand(hand))) { openMain(sp); return InteractionResult.SUCCESS; }
+                if (netRelease(sp, hand)) return InteractionResult.SUCCESS;
             }
+            return InteractionResult.PASS;
+        });
+        UseBlockCallback.EVENT.register((player, world, hand, hit) -> {
+            if (!(player instanceof ServerPlayer sp)) return InteractionResult.PASS;
+            if (hand == InteractionHand.MAIN_HAND && inVoid(sp) && crateClick(sp, hit.getBlockPos())) return InteractionResult.SUCCESS;
+            if (netRelease(sp, hand)) return InteractionResult.SUCCESS;
+            return InteractionResult.PASS;
+        });
+        UseEntityCallback.EVENT.register((player, world, hand, entity, hit) -> {
+            if (player instanceof ServerPlayer sp) return netCatch(sp, hand, entity);
             return InteractionResult.PASS;
         });
 
@@ -1344,11 +1764,23 @@ public class Oneblox implements ModInitializer {
             Integer last = LAST_FISH.put(id, fish);
             if (last != null && fish > last) pay(p, (long) (fish - last) * cfg.fishPay);
 
+            Map<String, Integer> oldKeys = data.keys.remove(id);   // keys from before they were physical items
+            if (oldKeys != null) for (Map.Entry<String, Integer> e : oldKeys.entrySet()) addKey(p, e.getKey(), e.getValue());
+            if (ticks % 100 == 0 && is.ready) {                   // infinite villager trades
+                String pn = p.getName().getString();
+                for (String who : new String[]{"villager", "wandering_trader"}) {
+                    String base = "execute as " + pn + " at @s as @e[type=minecraft:" + who + ",distance=..24] run data modify entity @s Offers.Recipes[].";
+                    run(base + "maxUses set value 1000000");
+                    run(base + "uses set value 0");
+                    run(base + "demand set value 0");
+                }
+            }
             perks(p);
             enforce(p, is);
             border(p, is);
             sidebar(p, is);
         }
+        if (!online.isEmpty() && !data.crateAt.isEmpty()) crateAmbience();
         SLOT.keySet().removeIf(k -> !online.contains(k));
         FLY.removeIf(k -> !online.contains(k));
     }
